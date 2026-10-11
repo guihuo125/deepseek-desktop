@@ -13,7 +13,7 @@ if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
 fs.mkdirSync(tmpDir, { recursive: true });
 
 // 复制运行时文件
-const files = ["main.js", "preload.js", "probe.js", "security.js", "runner.js", "package.json"];
+const files = ["main.js", "preload.js", "probe.js", "security.js", "runner.js", "package.json", "dialog.html", "dialog-preload.js"];
 for (const f of files) {
   fs.copyFileSync(path.join(appDir, f), path.join(tmpDir, f));
 }

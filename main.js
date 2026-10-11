@@ -212,23 +212,30 @@ function formatExecutionError(result, rawCode) {
   if (result.errorLine) {
     lines.push("【出错位置】第 " + result.errorLine + " 行" + (result.errorColumn ? " 第 " + result.errorColumn + " 列" : ""));
   }
+  var fullCode = rawCode || result.rawCode || "";
   lines.push("");
-  lines.push("【你的代码】");
+  lines.push("【你的代码】（原文）");
   lines.push("```javascript");
-  lines.push(rawCode || result.rawCode || "(空)");
+  lines.push(fullCode || "(空)");
   lines.push("```");
+  lines.push("");
+  lines.push("【代码长度】" + fullCode.length + " 字符");
   if (result.errorStack) {
     lines.push("");
     lines.push("【错误堆栈】");
     lines.push(result.errorStack);
   }
   lines.push("");
-  lines.push("请检查并修正上述代码后重新输出。常见原因：");
-  lines.push("1. 全角标点（中文引号/括号）→ 必须改成半角 () ; : , 和英文引号");
-  lines.push("2. 忘记 return");
-  lines.push("3. 括号/引号不配对");
-  lines.push("4. 使用了沙箱不允许的 API（require、process、fs、fetch）");
-  lines.push("5. 相对路径错误（应使用绝对路径或基于用户主目录）");
+  lines.push("【常见原因】");
+  lines.push("1. ⚠️ 字符串转义陷阱（最常见）：");
+  lines.push("   · JS 里反斜杠是转义符：\\t = Tab、\\n = 换行、\\r = 回车");
+  lines.push("   · Windows 路径要写双反斜杠：\"D:\\\\path\\\\file.txt\"");
+  lines.push("   · 推荐用正斜杠：\"D:/path/file.txt\"（工具会自动处理）");
+  lines.push("2. 全角标点 → 改成半角 () ; : , 和英文引号");
+  lines.push("3. 忘记 return");
+  lines.push("4. 括号/引号不配对");
+  lines.push("5. 使用了沙箱不允许的 API（require、process、fs、fetch）");
+  lines.push("6. 相对路径错误（应使用绝对路径或基于用户主目录）");
   return lines.join("\n");
 }
 
@@ -245,25 +252,63 @@ ipcMain.handle("check-cuckoo", async (event, payload) => {
   }
 });
 
+// ============ 自定义危险确认弹窗 ============
+function showDangerDialog(reasons) {
+  return new Promise((resolve) => {
+    const dialogWin = new BrowserWindow({
+      parent: mainWindow,
+      modal: true,
+      width: 520,
+      height: 480,
+      frame: false,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      skipTaskbar: true,
+      backgroundColor: "#ffffff",
+      webPreferences: {
+        preload: path.join(__dirname, "dialog-preload.js"),
+        additionalArguments: ["--dialog-data=" + Buffer.from(JSON.stringify({ reasons: reasons })).toString("base64")],
+        contextIsolation: true,
+        nodeIntegration: false,
+        devTools: false
+      }
+    });
+
+    let responded = false;
+
+    const handler = (event, result) => {
+      if (responded) return;
+      if (event.sender !== dialogWin.webContents) return;
+      responded = true;
+      ipcMain.removeListener("dialog-respond", handler);
+      resolve(!!result.allow);
+      if (!dialogWin.isDestroyed()) dialogWin.close();
+    };
+    ipcMain.on("dialog-respond", handler);
+
+    dialogWin.on("closed", () => {
+      if (!responded) {
+        responded = true;
+        ipcMain.removeListener("dialog-respond", handler);
+        resolve(false);
+      }
+    });
+
+    dialogWin.loadFile(path.join(__dirname, "dialog.html"));
+  });
+}
+
 // 执行 cuckoo 代码
 ipcMain.handle("execute-cuckoo", async (event, payload) => {
   const code = payload && payload.code || "";
   const blockId = payload && payload.blockId || "";
   const reasons = payload && payload.reasons || [];
 
-  // 危险命令 → 弹 dialog 确认
+  // 危险命令 → 弹自定义确认弹窗
   if (reasons && reasons.length > 0) {
-    const choice = dialog.showMessageBoxSync(mainWindow, {
-      type: "warning",
-      title: "⚠️ 危险操作确认",
-      message: "AI 请求执行以下敏感操作：",
-      detail: reasons.join("\n\n") + "\n\n是否继续执行？",
-      buttons: ["取消", "允许执行"],
-      defaultId: 0,
-      cancelId: 0,
-      noLink: true
-    });
-    if (choice !== 1) {
+    const allowed = await showDangerDialog(reasons);
+    if (!allowed) {
       return { status: "cancelled", ok: false };
     }
   }

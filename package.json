@@ -30,6 +30,8 @@
       "probe.js",
       "security.js",
       "runner.js",
+      "dialog.html",
+      "dialog-preload.js",
       "assets/**/*",
       "!assets/*.png",
       "!assets/*.ico.bak"

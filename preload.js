@@ -258,21 +258,19 @@ function scan(root) {
     }
     if (!hasTool) continue;
 
-    // ★ 消息级去重：同一 AI 消息只执行第一个代码块
+    // ★ 消息级去重：只检查（不设置，等执行时设置）
     var msgEl = pre.closest && pre.closest(".ds-message");
-    if (msgEl) {
-      if (msgEl.getAttribute("data-adshield-msg-done") === "1") {
-        console.log("[DeepSeek Desktop] 同一消息已有代码块在执行，跳过");
-        continue;
-      }
-      msgEl.setAttribute("data-adshield-msg-done", "1");
+    if (msgEl && msgEl.getAttribute("data-adshield-done") === "1") {
+      console.log("[DeepSeek Desktop] 同一消息已有代码块在执行，跳过");
+      continue;
     }
 
-    // ★ 立即标记元素（防止重复处理）
-    pre.setAttribute("data-adshield-processed", "1");
-
-    // 用完整代码 hash 作为 ID
-    var id = hashStr("block-" + codeText);
+    // ★ 用 pre 元素 ID（内容变了也用同一个 id，debounce 会重置 timer）
+    if (!pre.getAttribute("data-adshield-id")) {
+      window.__adshield_seq = (window.__adshield_seq || 0) + 1;
+      pre.setAttribute("data-adshield-id", "pre-" + window.__adshield_seq);
+    }
+    var id = pre.getAttribute("data-adshield-id");
     if (processedBlocks[id]) continue;
     scheduleExecute(pre, codeText, id);
   }
@@ -300,6 +298,18 @@ function scheduleExecute(block, code, id) {
 async function autoExecute(block, code, id, force) {
   if (!force && processedBlocks[id]) return;
   processedBlocks[id] = true;
+
+  // ★ 执行前设置消息标记（防止同消息的后续代码块也执行）
+  if (!force && block) {
+    var msgEl = block.closest && block.closest(".ds-message");
+    if (msgEl) {
+      if (msgEl.getAttribute("data-adshield-done") === "1") {
+        console.log("[DeepSeek Desktop] 消息已被其他代码块占用，跳过");
+        return;
+      }
+      msgEl.setAttribute("data-adshield-done", "1");
+    }
+  }
 
   // 超过链上限 → 显示按钮让用户手动点
   if (autoChain >= MAX_CHAIN) {
