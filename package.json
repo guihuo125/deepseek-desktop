@@ -1,0 +1,80 @@
+{
+  "name": "deepseek-desktop",
+  "version": "1.0.0",
+  "description": "DeepSeek 桌面客户端",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64"
+  },
+  "author": "guihuo125",
+  "license": "MIT",
+  "dependencies": {
+    "electron-updater": "^6.3.9",
+    "iconv-lite": "^0.6.3"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.guihuo125.deepseek",
+    "productName": "DeepSeek",
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "probe.js",
+      "security.js",
+      "runner.js",
+      "assets/**/*",
+      "!assets/*.png",
+      "!assets/*.ico.bak"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "menuCategory": false,
+      "shortcutName": "DeepSeek",
+      "artifactName": "DeepSeek-Setup-${version}.exe",
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "installerHeaderIcon": "icon.ico",
+      "installerSidebar": "installer-sidebar.bmp",
+      "uninstallerSidebar": "installer-sidebar.bmp",
+      "installerHeader": "installer-header.bmp",
+      "installerLanguages": ["zh_CN"],
+      "multiLanguageInstaller": true,
+      "unicode": true,
+      "runAfterFinish": true,
+      "include": "installer.nsh"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "guihuo125",
+        "repo": "deepseek-desktop",
+        "releaseType": "release"
+      }
+    ]
+  }
+}

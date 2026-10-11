@@ -1,0 +1,29 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+inno-out/
+out/
+.fast-asar-src/
+*.exe
+*.blockmap
+
+# 日志
+*.log
+*.log.err
+build.err
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 临时
+*.tmp
+.cache/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
