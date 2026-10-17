@@ -9,8 +9,6 @@ const FORBIDDEN = [
   { p: /\brm\s+-rf\s+\//i,               desc: "递归强制删除根目录，会删除整个系统" },
   { p: /\bdel\s+\/f\s+\/s\s+\/q\s+[a-z]:\\?\*/i, desc: "递归强制删除整盘文件，无法恢复" },
   { p: /\brd\s+\/s\s+\/q\s+[a-z]:\s*$/i, desc: "递归删除整个磁盘目录，无法恢复" },
-  { p: /\bshutdown\b/i,                    desc: "关机命令，会中断所有正在进行的工作" },
-  { p: /\breboot\b/i,                      desc: "重启命令，会中断所有正在进行的工作" },
   { p: /\bhalt\b/i,                        desc: "立即停止系统，可能导致数据损坏" },
   { p: /\bmkfs\b/i,                        desc: "格式化文件系统，会清空分区数据" },
   { p: /\bcipher\s+\/w/i,                 desc: "擦除磁盘空闲空间，无法恢复已删除文件" },
@@ -21,6 +19,8 @@ const FORBIDDEN = [
 
 // 需要确认（敏感操作）
 const DANGEROUS = [
+  { p: /\bshutdown\b/i,                    desc: "关机命令，会中断所有正在进行的工作" },
+  { p: /\breboot\b/i,                      desc: "重启命令，会中断所有正在进行的工作" },
   { p: /\brm\s+/i,                         desc: "删除文件或目录，无法恢复" },
   { p: /\bdel\s+/i,                        desc: "删除文件，无法恢复（不放入回收站）" },
   { p: /\brd\s+/i,                         desc: "删除目录，无法恢复" },

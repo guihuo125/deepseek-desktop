@@ -1,10 +1,13 @@
+
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("deepseekDesktop", {
   version: "1.2.0",
   platform: process.platform,
   executeCode: function(code, blockId) { return ipcRenderer.invoke("execute-cuckoo", { code: code, blockId: blockId }); },
-  checkCode: function(code) { return ipcRenderer.invoke("check-cuckoo", { code: code }); }
+  checkCode: function(code) { return ipcRenderer.invoke("check-cuckoo", { code: code }); },
+  selectWorkspace: function() { return ipcRenderer.invoke("select-workspace"); },
+  getWorkspace: function() { return ipcRenderer.invoke("get-workspace"); }
 });
 
 // ============ 状态 ============
@@ -12,6 +15,7 @@ var autoChain = 0;              // 当前自动执行链的计数
 var MAX_CHAIN = 3;              // 单链最多自动执行 3 次
 var pendingBlocks = {};         // { id: { code, timer } }
 var processedBlocks = {};       // 已执行的代码块
+var processedCount = 0;         // 计数，用于清理
 var __stylesInjected = false;
 
 // ============ 注入 CSS 动画（仅一次）============
@@ -54,6 +58,7 @@ if (document.readyState === "loading") {
 function init() {
   console.log("[DeepSeek Desktop] preload 注入成功 (自动模式)");
   ensureStyles();
+
   // ★ 网络 hook 触发已禁用（DeepSeek 分片 XHR 无法可靠累积）
   //   保留 probe.js 继续打印日志（研究用），但不用它触发执行
   // initNetworkListener();
@@ -71,11 +76,24 @@ function init() {
       if (hasNew) break;
     }
     if (hasNew) {
+      window.__adshield_dom_changed = true;
       setTimeout(function() { scan(document.body); }, 800);
     }
   });
   observer.observe(document.body, { childList: true, subtree: true });
   setTimeout(function() { scan(document.body); }, 2000);
+
+  // ★ 定时轮询兜底（每 2 秒），防止流式渲染漏掉代码块
+  var lastScanTime = Date.now();
+  setInterval(function() {
+    if (document.hidden) return; // 页面不可见时不扫，省性能
+    // 仅当最近有 DOM 变化（通过 MutationObserver 更新标记）或超过 5 秒没扫时，才执行全量扫描
+    if (window.__adshield_dom_changed || Date.now() - lastScanTime > 5000) {
+      scan(document.body);
+      lastScanTime = Date.now();
+      window.__adshield_dom_changed = false;
+    }
+  }, 2000);
 }
 
 // ============ 从纯文本提取 cuckoo 代码块（网络 hook 版）============
@@ -199,11 +217,14 @@ function scan(root) {
     var skipMarkers = [
       "你是由 Cuckoo Code 驱动",
       "你是由Cuckoo",
+      "你有完整的本地执行权限",
+      "核心机制",
       "可用工具：",
       "可用工具:",
       "bash(命令)",
       "bash(命令）",
       "pwsh(命令)",
+      "python(代码)",
       "示例：",
       "示例:",
       "规则：只输出安全",
@@ -273,6 +294,13 @@ function scan(root) {
     var id = pre.getAttribute("data-adshield-id");
     if (processedBlocks[id]) continue;
     scheduleExecute(pre, codeText, id);
+    processedCount++;
+    if (processedCount > 100) {
+      // 防止内存泄漏：当数量超过 100 时，清理一半的旧记录
+      processedBlocks = {};
+      processedCount = 0;
+      console.log("[DeepSeek Desktop] 清理历史执行记录缓存");
+    }
   }
 }
 
@@ -342,11 +370,11 @@ async function autoExecute(block, code, id, force) {
       return;
     }
     if (confirmResult.ok) {
-      injectButton(block, code, id, "✅ 执行完成，结果已自动发送");
-      await sendToInput(formatResult(confirmResult));
+      injectButton(block, code, id, "✅ 执行完成，已通知 AI");
     } else {
-      injectButton(block, code, id, "❌ " + (confirmResult.error || "执行失败"));
+      injectButton(block, code, id, "❌ 执行失败，已发送错误报告");
     }
+    await sendToInput(formatResult(confirmResult));
     return;
   }
 
@@ -356,18 +384,14 @@ async function autoExecute(block, code, id, force) {
   try {
     var result = await ipcRenderer.invoke("execute-cuckoo", { code: code, blockId: id });
     if (result.ok) {
-      if (result.hasOutput === false) {
-        // 无输出：不发送
-        updateStatus(statusEl, "✅ 已执行（无输出）");
-      } else {
-        updateStatus(statusEl, "✅ 已执行，结果已自动发送");
-        await sendToInput(formatResult(result));
-      }
+      updateStatus(statusEl, "✅ 已执行，已通知 AI");
     } else {
-      updateStatus(statusEl, "❌ " + (result.error || "执行失败"));
+      updateStatus(statusEl, "❌ 执行失败，已发送错误报告");
     }
+    await sendToInput(formatResult(result));
   } catch (e) {
-    updateStatus(statusEl, "❌ " + e.message);
+    updateStatus(statusEl, "❌ 调用异常，已发送错误报告");
+    await sendToInput("【JS 执行结果汇总】\n—— 脚本 1 ——\n❌ 失败\n错误原因: " + e.message);
   }
 
   // 更新按钮文字为"再次执行"
@@ -649,16 +673,30 @@ function findSendButton() {
 
 // ============ 结果格式化 ============
 function formatResult(result) {
-  if (!result) return "执行结果：\n(无返回)";
-  var out = result.result;
-  if (out === undefined || out === null) out = "(无输出)";
-  if (typeof out !== "string") {
-    try { out = JSON.stringify(out, null, 2); } catch (e) { out = String(out); }
+  let text = "【JS 执行结果汇总】(共 1 个脚本)\n\n";
+  text += "—— 脚本 1 ——\n";
+  
+  if (result.ok) {
+    text += "✅ 成功\n";
+    // 如果代码中有 log() 输出，一并带上
+    if (result.logs && result.logs.length > 0) {
+      text += result.logs.join("\n") + "\n";
+    }
+    if (result.hasOutput === false) {
+      // 无输出时保持简洁，不再附加冗余提示文字
+    } else {
+      let out = result.result;
+      if (typeof out !== "string") {
+        try { out = JSON.stringify(out, null, 2); } catch (e) { out = String(out); }
+      }
+      if (out && out.length > 8000) out = out.substring(0, 8000) + "\n...(已截断)";
+      text += out;
+    }
+  } else {
+    text += "❌ 失败\n";
+    text += "错误原因: " + (result.error || "未知错误") + "\n";
   }
-  if (!out) out = "(无输出)";
-  // 限制长度（避免输入框溢出）
-  if (out.length > 8000) out = out.substring(0, 8000) + "\n...(已截断)";
-  return "执行结果：\n" + out;
+  return text;
 }
 
 // ============ 工具函数 ============
@@ -699,4 +737,80 @@ function hashStr(s) {
     h |= 0;
   }
   return "cb-" + Math.abs(h);
+}
+
+
+
+
+// ============ 工作区 UI ============
+function injectWorkspaceUI() {
+  const btnId = 'adshield-workspace-btn';
+  setInterval(async () => {
+    // 通过文本内容或者类名查找“开启新对话”按钮
+    const btn = Array.from(document.querySelectorAll('button, .ds-button, div')).find(el => {
+      return el.textContent.trim() === '开启新对话' || el.innerHTML.includes('开启新对话');
+    });
+
+    if (!btn || !btn.parentElement) return;
+    
+    // 如果已经有按钮了，检查是不是紧跟在后面，不是的话重新挂载
+    let existing = document.getElementById(btnId);
+    if (existing) {
+      if (existing.previousSibling !== btn) {
+        btn.parentElement.insertBefore(existing, btn.nextSibling);
+      }
+      return;
+    }
+
+    // 创建新按钮
+    const container = document.createElement('div');
+    container.id = btnId;
+    container.style.cssText = "display:flex; align-items:center; margin: 8px 12px; padding: 8px 12px; background: rgba(79, 70, 229, 0.08); border: 1px dashed rgba(79, 70, 229, 0.4); border-radius: 8px; cursor: pointer; transition: all 0.2s; user-select: none;";
+
+    const icon = document.createElement('span');
+    icon.innerHTML = '📁';
+    icon.style.cssText = "margin-right: 8px; font-size: 14px;";
+
+    const text = document.createElement('span');
+    text.id = 'adshield-workspace-text';
+    text.style.cssText = "color: #4f46e5; font-size: 13px; font-weight: 500; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+    text.textContent = "选择工作区";
+
+    container.appendChild(icon);
+    container.appendChild(text);
+
+    container.onclick = async () => {
+      text.textContent = "请选择...";
+      try {
+        const res = await window.deepseekDesktop.selectWorkspace();
+        if (res && res.path) {
+          updateWorkspaceText(res.path);
+        } else {
+          const old = await window.deepseekDesktop.getWorkspace();
+          updateWorkspaceText(old);
+        }
+      } catch (e) {
+        text.textContent = "选择失败";
+      }
+    };
+
+    btn.parentElement.insertBefore(container, btn.nextSibling);
+    window.deepseekDesktop.getWorkspace().then(updateWorkspaceText);
+  }, 1000);
+}
+
+function updateWorkspaceText(path) {
+  const textEl = document.getElementById('adshield-workspace-text');
+  if (!textEl) return;
+  const container = document.getElementById('adshield-workspace-btn');
+  if (path) {
+    const folderName = path.split(/[\\/]/).filter(Boolean).pop() || path;
+    textEl.textContent = folderName;
+    textEl.title = path;
+    if (container) container.style.border = "1px solid rgba(79, 70, 229, 0.6)";
+  } else {
+    textEl.textContent = "选择工作区";
+    textEl.title = "点击选择项目文件夹";
+    if (container) container.style.border = "1px dashed rgba(79, 70, 229, 0.4)";
+  }
 }

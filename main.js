@@ -1,18 +1,41 @@
-const { app, BrowserWindow, Tray, Menu, globalShortcut, Notification, shell, dialog } = require("electron");
+const { app, BrowserWindow, WebContentsView, Tray, Menu, globalShortcut, Notification, shell, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { autoUpdater } = require("electron-updater");
 
+// ============ 强制使用独立显卡 ============
+// NVIDIA 强制独显环境变量
+process.env.SHIM_MCCOMPAT = '0x800000001';
+
 const URL = "https://chat.deepseek.com/";
 const APP_NAME = "DeepSeek";
+
+// ============ 强制启用高性能独立显卡渲染 ============
+app.commandLine.appendSwitch("ignore-gpu-blocklist");      // 忽略 GPU 黑名单
+app.commandLine.appendSwitch("enable-gpu-rasterization");  // 强制开启 GPU 光栅化
+app.commandLine.appendSwitch("enable-zero-copy");          // 强制开启零拷贝
+app.commandLine.appendSwitch("force_high_performance_gpu");
+
+// 禁止后台节流和效率模式（防止被系统调度到核显）
+app.commandLine.appendSwitch("disable-renderer-backgrounding");
+app.commandLine.appendSwitch("disable-background-timer-throttling");
+app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+
+// 优化内存与垃圾回收
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=4096'); // 增加老生代内存
+app.commandLine.appendSwitch('enable-features', 'NetworkServiceInProcess'); // 提升网络加载速度// 请求系统使用高性能显卡
 
 // 配置文件（记住窗口大小/位置）
 const CONFIG_DIR = path.join(app.getPath("userData"));
 const CONFIG_FILE = path.join(CONFIG_DIR, "window-state.json");
 
-let mainWindow = null;
+let mainWindow = null;   // 壳窗口（地址栏）
+let aiView = null;       // AI 网页视图（WebContentsView）
 let tray = null;
 let isQuitting = false;
+
+// 地址栏高度（与 shell.html 里的 .address-bar 一致）
+const ADDRESS_BAR_HEIGHT = 48;
 
 // 读取窗口状态
 function loadWindowState() {
@@ -37,6 +60,7 @@ function saveWindowState() {
 function createWindow() {
   const state = loadWindowState();
 
+  // === 1. 创建壳窗口（只装地址栏） ===
   mainWindow = new BrowserWindow({
     width: state.width,
     height: state.height,
@@ -47,10 +71,9 @@ function createWindow() {
     title: APP_NAME,
     icon: path.join(__dirname, "assets", "icon.ico"),
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: path.join(__dirname, "shell-preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      spellcheck: false,
       devTools: true
     },
     backgroundColor: "#ffffff",
@@ -58,43 +81,113 @@ function createWindow() {
     autoHideMenuBar: true
   });
 
-  mainWindow.loadURL(URL);
+  // 加载壳页面（地址栏）
+  mainWindow.loadFile(path.join(__dirname, "shell.html"));
 
-  // ★ P1：注入网络探测 hook（在 main world 抓 fetch/XHR）
+  // === 2. 创建 AI 网页视图（WebContentsView） ===
+  aiView = new WebContentsView({
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      spellcheck: false,
+      devTools: true
+    }
+  });
+
+  // 加到主窗口的 contentView（在壳页面下方）
+  mainWindow.contentView.addChildView(aiView);
+
+  // 布局：地址栏高度 48px，其余给 AI 网页
+  function layoutView() {
+    if (!mainWindow || mainWindow.isDestroyed() || !aiView) return;
+    const [w, h] = mainWindow.getContentSize();
+    aiView.setBounds({
+      x: 0,
+      y: ADDRESS_BAR_HEIGHT,
+      width: w,
+      height: Math.max(0, h - ADDRESS_BAR_HEIGHT)
+    });
+  }
+
+  // 初始布局 + 窗口大小变化时重新布局
+  layoutView();
+  mainWindow.on("resize", layoutView);
+
+  // 加载 AI 网页
+  aiView.webContents.loadURL(URL);
+
+  // === 3. 注入 probe hook（main world 抓 fetch/XHR） ===
   const PROBE_CODE = fs.readFileSync(path.join(__dirname, "probe.js"), "utf-8");
-
-  // 每次页面加载完成 → 注入
-  mainWindow.webContents.on("did-finish-load", () => {
-    mainWindow.webContents.executeJavaScript(PROBE_CODE).catch((e) => {
+  aiView.webContents.on("did-finish-load", () => {
+    aiView.webContents.executeJavaScript(PROBE_CODE).catch((e) => {
       console.error("[probe] 注入失败:", e.message);
     });
   });
 
-  // 接收 hook 通过 postMessage 抛出的数据
-  mainWindow.webContents.on("console-message", (event, level, message) => {
+  // 转发 probe 日志
+  aiView.webContents.on("console-message", (event, level, message) => {
     if (message && message.indexOf("[probe]") !== -1) {
       console.log("[probe]", message);
     }
   });
 
-  // F12 打开 DevTools
-  mainWindow.webContents.on("before-input-event", (e, input) => {
+  // === 4. F12 打开 DevTools（AI 视图） ===
+  aiView.webContents.on("before-input-event", (e, input) => {
     if (input.key === "F12" && input.type === "keyDown") {
-      mainWindow.webContents.openDevTools({ mode: "detach" });
+      aiView.webContents.openDevTools({ mode: "detach" });
       e.preventDefault();
     }
   });
 
-  // 首次加载完成才显示（避免白屏）
+  // === 5. 状态推送（URL / 加载 / 前进后退可用性） ===
+  function pushShellState(extra) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const state = Object.assign({
+      url: aiView.webContents.getURL() || URL,
+      canGoBack: aiView.webContents.navigationHistory ? aiView.webContents.navigationHistory.canGoBack() : aiView.webContents.canGoBack(),
+      canGoForward: aiView.webContents.navigationHistory ? aiView.webContents.navigationHistory.canGoForward() : aiView.webContents.canGoForward()
+    }, extra || {});
+    mainWindow.webContents.send("shell-state", state);
+  }
+
+  aiView.webContents.on("did-start-loading", () => pushShellState({ status: "loading" }));
+  aiView.webContents.on("did-stop-loading", () => pushShellState({ status: "ok" }));
+  aiView.webContents.on("did-navigate", () => pushShellState());
+  aiView.webContents.on("did-navigate-in-page", () => pushShellState());
+  aiView.webContents.on("did-fail-load", (e, code, desc) => {
+    pushShellState({ status: "error" });
+    console.error("[shell] 页面加载失败:", code, desc);
+  });
+
+  // 首次加载完成 → 推送完整状态
+  mainWindow.webContents.on("did-finish-load", () => {
+    setTimeout(() => pushShellState({ status: "ok" }), 200);
+  });
+
+  // === 6. 壳页面 IPC（前进/后退/刷新/主页） ===
+  const { ipcMain: shellIpcMain } = require("electron");
+  const shellHandlers = {
+    "shell-back": () => { if (aiView.webContents.navigationHistory) aiView.webContents.navigationHistory.goBack(); else aiView.webContents.goBack(); },
+    "shell-forward": () => { if (aiView.webContents.navigationHistory) aiView.webContents.navigationHistory.goForward(); else aiView.webContents.goForward(); },
+    "shell-reload": () => aiView.webContents.reload(),
+    "shell-home": () => aiView.webContents.loadURL(URL)
+  };
+  Object.keys(shellHandlers).forEach((channel) => {
+    shellIpcMain.removeAllListeners(channel);
+    shellIpcMain.on(channel, shellHandlers[channel]);
+  });
+
+  // === 7. 首次加载完成才显示（避免白屏） ===
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
   });
 
-  // 保存窗口状态
+  // === 8. 保存窗口状态 ===
   mainWindow.on("resize", saveWindowState);
   mainWindow.on("move", saveWindowState);
 
-  // 关闭时最小化到托盘（不退出）
+  // === 9. 关闭时最小化到托盘 ===
   mainWindow.on("close", (e) => {
     if (!isQuitting) {
       e.preventDefault();
@@ -102,8 +195,8 @@ function createWindow() {
     }
   });
 
-  // 外部链接用默认浏览器打开
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  // === 10. 外部链接用默认浏览器打开（AI 视图） ===
+  aiView.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith("http")) {
       shell.openExternal(url);
       return { action: "deny" };
@@ -111,15 +204,15 @@ function createWindow() {
     return { action: "allow" };
   });
 
-  // 拦截导航（防止跳到非 DeepSeek 域名）
-  mainWindow.webContents.on("will-navigate", (e, url) => {
+  // === 11. 拦截导航（防止跳到非 DeepSeek 域名） ===
+  aiView.webContents.on("will-navigate", (e, url) => {
     if (!url.includes("deepseek.com")) {
       e.preventDefault();
       shell.openExternal(url);
     }
   });
 
-  // 页面标题变化时同步窗口标题
+  // === 12. 页面标题变化时同步窗口标题 ===
   mainWindow.on("page-title-updated", (e) => {
     e.preventDefault();
   });
@@ -243,6 +336,41 @@ const security = require("./security.js");
 const runner = require("./runner.js");
 
 // 检查代码危险程度
+// ============ 工作区管理 ============
+const WORKSPACE_FILE = path.join(app.getPath("userData"), "workspace.json");
+let currentWorkspace = "";
+
+// 启动时读取上次的工作区
+try {
+  if (fs.existsSync(WORKSPACE_FILE)) {
+    const data = JSON.parse(fs.readFileSync(WORKSPACE_FILE, "utf-8"));
+    if (data.workspace && fs.existsSync(data.workspace)) {
+      currentWorkspace = data.workspace;
+    }
+  }
+} catch (e) {}
+
+ipcMain.handle("get-workspace", () => {
+  return { path: currentWorkspace };
+});
+
+ipcMain.handle("select-workspace", async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "请选择要分析的项目目录",
+    properties: ["openDirectory"]
+  });
+  if (!result.canceled && result.filePaths.length > 0) {
+    currentWorkspace = result.filePaths[0];
+    try {
+      fs.writeFileSync(WORKSPACE_FILE, JSON.stringify({ workspace: currentWorkspace }), "utf-8");
+    } catch (e) {
+      console.error("保存工作区失败:", e);
+    }
+    return { path: currentWorkspace };
+  }
+  return { path: null };
+});
+
 ipcMain.handle("check-cuckoo", async (event, payload) => {
   try {
     const code = payload && payload.code || "";
@@ -317,6 +445,7 @@ ipcMain.handle("execute-cuckoo", async (event, payload) => {
   const logs = [];
   try {
     const result = await runner.runCuckooCode(code, {
+      workspace: currentWorkspace,
       onLog: (msg) => {
         logs.push(msg);
         console.log("[cuckoo]", msg);
@@ -350,9 +479,8 @@ ipcMain.handle("execute-cuckoo", async (event, payload) => {
     // 无输出时跳过注入
     if (hasOutput) {
       try {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          const safeOutput = String(outputText).replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
-          await mainWindow.webContents.executeJavaScript(
+        if (aiView && aiView.webContents && !aiView.webContents.isDestroyed()) {
+          await aiView.webContents.executeJavaScript(
             "(function(){" +
             "  var ta = document.querySelector('textarea');" +
             "  if (!ta) return { ok: false };" +
@@ -385,7 +513,14 @@ ipcMain.handle("execute-cuckoo", async (event, payload) => {
 });
 
 // 应用就绪
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  try {
+    const gpuInfo = await app.getGPUInfo("basic");
+    if (gpuInfo && gpuInfo.gpuDevice && gpuInfo.gpuDevice.length > 0) {
+      const dev = gpuInfo.gpuDevice[0];
+      console.log("[DeepSeek GPU] 当前使用的显卡: " + dev.deviceString);
+    }
+  } catch (e) {}
   // 隐藏默认菜单栏
   Menu.setApplicationMenu(null);
 

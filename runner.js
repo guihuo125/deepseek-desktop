@@ -127,26 +127,45 @@ function findPython() {
 // 创建工具函数集
 function createTools(options) {
   options = options || {};
+  // 优先使用用户选择的工作区
+  var cwdBase = options.workspace && options.workspace.trim() !== "" ? options.workspace : DEFAULT_CWD;
   var logFn = function() {
     if (options.onLog) options.onLog(Array.prototype.slice.call(arguments).map(String).join(" "));
   };
+
+  // 安全路径检查：确保路径解析后仍然在工作区内
+  function safePath(p) {
+    if (!p) throw new Error("路径不能为空");
+    var abs = path.isAbsolute(p) ? path.normalize(p) : path.resolve(cwdBase, p);
+    var base = path.normalize(cwdBase);
+    // 确保绝对的 base 下
+    if (abs === base) return abs;
+    if (!abs.startsWith(base + path.sep)) {
+      throw new Error("安全限制：禁止访问工作区之外的路径（" + abs + "）");
+    }
+    return abs;
+  }
 
   return {
     log: logFn,
 
     bash: async function(command, opts) {
+      opts = Object.assign({}, opts);
+      if (!opts.cwd) opts.cwd = cwdBase;
       var r = await execShell(command, Object.assign({}, opts, { shell: "bash" }));
       return r.output;
     },
 
     pwsh: async function(command, opts) {
+      opts = Object.assign({}, opts);
+      if (!opts.cwd) opts.cwd = cwdBase;
       var r = await execShell(command, Object.assign({}, opts, { shell: "pwsh" }));
       return r.output;
     },
 
     read: async function(filePath, opts) {
       opts = opts || {};
-      var abs = path.isAbsolute(filePath) ? filePath : path.join(DEFAULT_CWD, filePath);
+      var abs = safePath(filePath);
       var content = fs.readFileSync(abs, "utf-8");
       var lines = content.split("\n");
       var offset = opts.offset || 1;
@@ -157,7 +176,7 @@ function createTools(options) {
     },
 
     write: async function(filePath, content) {
-      var abs = path.isAbsolute(filePath) ? filePath : path.join(DEFAULT_CWD, filePath);
+      var abs = safePath(filePath);
       var dir = path.dirname(abs);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(abs, content, "utf-8");
@@ -165,7 +184,7 @@ function createTools(options) {
     },
 
     edit: async function(filePath, oldString, newString, replaceAll) {
-      var abs = path.isAbsolute(filePath) ? filePath : path.join(DEFAULT_CWD, filePath);
+      var abs = safePath(filePath);
       var content = fs.readFileSync(abs, "utf-8");
       if (content.indexOf(oldString) === -1) throw new Error("oldString 未找到");
       if (replaceAll) {
@@ -180,7 +199,7 @@ function createTools(options) {
     },
 
     glob: async function(pattern, searchPath) {
-      var base = searchPath ? (path.isAbsolute(searchPath) ? searchPath : path.join(DEFAULT_CWD, searchPath)) : DEFAULT_CWD;
+      var base = searchPath ? safePath(searchPath) : cwdBase;
       var regex = new RegExp("^" + pattern.replace(/\\*\\*/g, ".*").replace(/\\*/g, "[^/\\\\]*").replace(/\\?/g, ".") + "$");
       var results = [];
       function walk(dir, depth) {
@@ -206,7 +225,7 @@ function createTools(options) {
 
     grep: async function(pattern, opts) {
       opts = opts || {};
-      var base = opts.path ? (path.isAbsolute(opts.path) ? opts.path : path.join(DEFAULT_CWD, opts.path)) : DEFAULT_CWD;
+      var base = opts.path ? safePath(opts.path) : cwdBase;
       var re = new RegExp(pattern);
       var include = opts.include || "*";
       var includeRe = new RegExp("^" + include.replace(/\\*/g, ".*").replace(/\\./g, "\\\\.") + "$");

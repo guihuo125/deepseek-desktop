@@ -319,13 +319,13 @@ body {
 
     <div class="details" id="details">加载中...</div>
 
-    <div class="warn-tip">
+    <div class="warn-tip" id="warn-tip" style="display:none;">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10"/>
         <line x1="12" y1="8" x2="12" y2="12"/>
         <line x1="12" y1="16" x2="12.01" y2="16"/>
       </svg>
-      <span>删除操作不放入回收站，请确认后继续</span>
+      <span id="warn-text"></span>
     </div>
   </div>
 
@@ -368,6 +368,25 @@ body {
         }
       }
       el.innerHTML = html;
+
+      // 动态显示警告（仅当包含删除类操作时）
+      var warnTip = document.getElementById("warn-tip");
+      var warnText = document.getElementById("warn-text");
+      if (warnTip && warnText) {
+        var hasDelete = false;
+        for (var j = 0; j < reasons.length; j++) {
+          if (/\b(del|rm|rmdir|rd)\b/i.test(reasons[j]) || reasons[j].indexOf("删除文件") !== -1 || reasons[j].indexOf("删除目录") !== -1) {
+            hasDelete = true;
+            break;
+          }
+        }
+        if (hasDelete) {
+          warnText.textContent = "删除操作不放入回收站，请确认后继续";
+          warnTip.style.display = "flex";
+        } else {
+          warnTip.style.display = "none";
+        }
+      }
     });
 
     function escapeHtml(s) {

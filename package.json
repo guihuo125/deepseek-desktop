@@ -32,6 +32,8 @@
       "runner.js",
       "dialog.html",
       "dialog-preload.js",
+      "shell.html",
+      "shell-preload.js",
       "assets/**/*",
       "!assets/*.png",
       "!assets/*.ico.bak"

@@ -15,7 +15,7 @@ AppName={#MyAppNameCN}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppNameCN} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={autopf}\{#MyAppName}
+DefaultDirName=D:\Program Files\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=D:\DeepSeek 桌面应用\deepseek-app\inno-out
 OutputBaseFilename=DeepSeek-Setup-{#MyAppVersion}
@@ -65,9 +65,11 @@ Name: "{group}\卸载 {#MyAppNameCN}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall
 
 [Registry]
+; 强制 DeepSeek 使用高性能独立显卡 (GpuPreference=2)
+Root: HKCU; Subkey: "Software\Microsoft\DirectX\UserGpuPreferences"; ValueType: string; ValueName: "{app}\{#MyAppExeName}"; ValueData: "GpuPreference=2;"; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}_is1"; ValueType: string; ValueName: "DisplayName"; ValueData: "{#MyAppNameCN}"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}_is1"; ValueType: string; ValueName: "DisplayVersion"; ValueData: "{#MyAppVersion}"
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}_is1"; ValueType: string; ValueName: "Publisher"; ValueData: "{#MyAppPublisher}"

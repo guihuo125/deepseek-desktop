@@ -13,9 +13,17 @@ if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
 fs.mkdirSync(tmpDir, { recursive: true });
 
 // 复制运行时文件
-const files = ["main.js", "preload.js", "probe.js", "security.js", "runner.js", "package.json", "dialog.html", "dialog-preload.js"];
+const files = ["main.js", "preload.js", "probe.js", "security.js", "runner.js", "package.json", "dialog.html", "dialog-preload.js", "shell.html", "shell-preload.js"];
 for (const f of files) {
   fs.copyFileSync(path.join(appDir, f), path.join(tmpDir, f));
+}
+
+// ★ 复制 assets 目录（图标、图片）
+const assetsSrc = path.join(appDir, "assets");
+const assetsDst = path.join(tmpDir, "assets");
+if (fs.existsSync(assetsSrc)) {
+  fs.cpSync(assetsSrc, assetsDst, { recursive: true });
+  console.log("已复制 assets 目录");
 }
 
 // ★ 从 package.json 读取所有生产依赖，递归复制
