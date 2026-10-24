@@ -1,7 +1,7 @@
 {
   "name": "deepseek-desktop",
   "version": "1.0.0",
-  "description": "DeepSeek Desktop",
+  "description": "DeepSeek 桌面客户端",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -58,7 +58,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "DeepSeek",
-      "artifactName": "DeepSeek-Setup-1.0.0.exe",
+      "artifactName": "DeepSeek-Setup-${version}.exe",
       "installerIcon": "icon.ico",
       "uninstallerIcon": "icon.ico",
       "installerSidebar": "installer-sidebar.bmp",
