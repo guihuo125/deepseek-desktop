@@ -175,7 +175,9 @@
             var finalText = __sessions[sessionKey].text;
             delete __sessions[sessionKey];
             if (finalText) {
-              window.postMessage({ __adshield_ai_reply: true, text: finalText, ts: Date.now() }, '*');
+              // 用当前页自己的 origin，不要用 '*'：这段文本是 AI 回复原文，
+              // 一旦页面被导航到别的 origin，'*' 就等于把它广播给那个页面
+              window.postMessage({ __adshield_ai_reply: true, text: finalText, ts: Date.now() }, window.location.origin);
               LOG('posted:debounced', { textLen: finalText.length, preview: finalText.slice(0, 200) });
             }
           }, 4000);

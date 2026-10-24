@@ -341,8 +341,8 @@ body {
   </div>
 
   <div class="kbd-hint">
-    <span><span class="kbd">Esc</span> 取消</span>
-    <span><span class="kbd">Enter</span> 确认</span>
+    <span><span class="kbd">Esc</span> / <span class="kbd">Enter</span> 取消</span>
+    <span>要放行请点击「允许执行」</span>
   </div>
 
   <script>
@@ -405,8 +405,15 @@ body {
     }
 
     document.addEventListener("keydown", function(e) {
-      if (e.key === "Escape") respond(false);
-      if (e.key === "Enter") respond(true);
+      if (e.key === "Escape") { e.preventDefault(); respond(false); return; }
+      // 危险确认框默认走安全侧：Enter 一律视为取消。
+      // 只有焦点明确落在按钮上时才交给按钮自己处理，避免误按回车放行。
+      if (e.key === "Enter") {
+        var tag = e.target && e.target.tagName;
+        if (tag === "BUTTON" || tag === "A") return;
+        e.preventDefault();
+        respond(false);
+      }
     });
   </script>
 </body>

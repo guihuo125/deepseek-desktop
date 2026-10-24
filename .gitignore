@@ -22,6 +22,7 @@ desktop.ini
 # 临时
 *.tmp
 .cache/
+.tmp-*/
 
 # 编辑器
 .vscode/

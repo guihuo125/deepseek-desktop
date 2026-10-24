@@ -1,7 +1,7 @@
 {
   "name": "deepseek-desktop",
   "version": "1.0.0",
-  "description": "DeepSeek 桌面客户端",
+  "description": "DeepSeek Desktop",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -30,6 +30,7 @@
       "probe.js",
       "security.js",
       "runner.js",
+      "runner-worker.js",
       "dialog.html",
       "dialog-preload.js",
       "shell.html",
@@ -56,21 +57,17 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "menuCategory": false,
       "shortcutName": "DeepSeek",
-      "artifactName": "DeepSeek-Setup-${version}.exe",
-      "deleteAppDataOnUninstall": false,
+      "artifactName": "DeepSeek-Setup-1.0.0.exe",
       "installerIcon": "icon.ico",
       "uninstallerIcon": "icon.ico",
-      "installerHeaderIcon": "icon.ico",
       "installerSidebar": "installer-sidebar.bmp",
       "uninstallerSidebar": "installer-sidebar.bmp",
       "installerHeader": "installer-header.bmp",
-      "installerLanguages": ["zh_CN"],
-      "multiLanguageInstaller": true,
-      "unicode": true,
-      "runAfterFinish": true,
-      "include": "installer.nsh"
+      "installerLanguages": [
+        "zh_CN"
+      ],
+      "runAfterFinish": true
     },
     "publish": [
       {

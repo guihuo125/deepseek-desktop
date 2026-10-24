@@ -15,25 +15,29 @@ AppName={#MyAppNameCN}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppNameCN} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName=D:\Program Files\{#MyAppName}
+; 安装目录跟着权限走：普通用户装到 LocalAppData 下的 Program Files，
+; 提权安装才进 Program Files。写死 D:\ 会在没有 D 盘的机器上直接失败。
+DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
-OutputDir=D:\DeepSeek 桌面应用\deepseek-app\inno-out
+; 所有路径以脚本所在目录为基准，换机器/换盘符都能编
+OutputDir={#SourcePath}inno-out
 OutputBaseFilename=DeepSeek-Setup-{#MyAppVersion}
-Compression=lzma2/max
-SolidCompression=yes
+VersionInfoVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppNameCN}
+Compression=lzma2/fast
+SolidCompression=no
+
+; ===== 品牌资源 =====
+SetupIconFile={#SourcePath}assets\icon.ico
+WizardImageFile={#SourcePath}assets\installer-sidebar.bmp
+WizardSmallImageFile={#SourcePath}assets\installer-small.bmp
 
 ; ===== 界面优化 =====
 WizardStyle=modern
 WizardSizePercent=110
-WizardResizable=no
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
 DisableReadyPage=no
-
-; ===== 品牌资源 =====
-SetupIconFile=D:\DeepSeek 桌面应用\deepseek-app\assets\icon.ico
-WizardImageFile=D:\DeepSeek 桌面应用\deepseek-app\assets\installer-sidebar.bmp
-WizardSmallImageFile=D:\DeepSeek 桌面应用\deepseek-app\assets\installer-small.bmp
 
 ; ===== 语言 =====
 ShowLanguageDialog=no
@@ -57,7 +61,7 @@ chinesesimp.LaunchApp=立即启动 {#MyAppNameCN}
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "附加选项：";
 
 [Files]
-Source: "D:\DeepSeek 桌面应用\deepseek-app\dist\win-unpacked\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourcePath}dist\win-unpacked\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"
@@ -65,16 +69,14 @@ Name: "{group}\卸载 {#MyAppNameCN}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall shellexec runasoriginaluser; WorkingDir: "{app}"
 
 [Registry]
 ; 强制 DeepSeek 使用高性能独立显卡 (GpuPreference=2)
 Root: HKCU; Subkey: "Software\Microsoft\DirectX\UserGpuPreferences"; ValueType: string; ValueName: "{app}\{#MyAppExeName}"; ValueData: "GpuPreference=2;"; Flags: uninsdeletevalue
-Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}_is1"; ValueType: string; ValueName: "DisplayName"; ValueData: "{#MyAppNameCN}"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}_is1"; ValueType: string; ValueName: "DisplayVersion"; ValueData: "{#MyAppVersion}"
-Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}_is1"; ValueType: string; ValueName: "Publisher"; ValueData: "{#MyAppPublisher}"
-Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}_is1"; ValueType: string; ValueName: "DisplayIcon"; ValueData: "{app}\{#MyAppExeName}"
-Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}_is1"; ValueType: string; ValueName: "UninstallString"; ValueData: """{uninstallexe}"""
+; 卸载表项由 Inno 按 AppId 自动写入（DisplayName/DisplayIcon/UninstallString
+; 分别来自 UninstallDisplayName、UninstallDisplayIcon 和内置逻辑）。
+; 这里再手写一份 DeepSeek_is1 会让控制面板出现两个同名卸载入口。
 
 [Code]
 var
