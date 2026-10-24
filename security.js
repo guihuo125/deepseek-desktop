@@ -533,12 +533,51 @@ function extractCommands(code) {
     .map(function (c) { return c.args[0] ? (c.args[0].literal || c.args[0].raw) : ""; });
 }
 
+// ============ 壳层安全状态（地址栏锁图标的数据源）============
+// 域名与协议的权威判定只在这里写一份。main.js 的 isTrustedUrl、注入侧 preload
+// 的门控、以及这里的三态计算都必须与它一致 —— 否则会出现「锁显示绿色，
+// 但本地能力其实没开」这种自相矛盾的界面，那比没有指示更糟。
+function isDeepSeekUrl(url) {
+  try {
+    const u = new URL(String(url));
+    if (u.protocol !== "https:") return false;
+    const h = u.hostname.toLowerCase();
+    return h === "deepseek.com" || h.endsWith(".deepseek.com");
+  } catch (e) {
+    return false;
+  }
+}
+
+// opts: { workspace, certError }
+function shellSecurityInfo(url, opts) {
+  const o = opts || {};
+  let proto = "", host = "";
+  try {
+    const u = new URL(String(url));
+    proto = u.protocol;
+    host = u.hostname.toLowerCase();
+  } catch (e) {}
+  const https = proto === "https:";
+  const deepseek = isDeepSeekUrl(url);
+  return {
+    level: deepseek ? "secure-app" : (https ? "secure-web" : "insecure"),
+    https: https,
+    host: host,
+    isDeepSeek: deepseek,
+    capability: deepseek ? "enabled" : (https ? "disabled-third-party" : "disabled-insecure"),
+    workspace: deepseek ? String(o.workspace || "") : "",
+    certError: (o.certError && o.certError.url === String(url)) ? o.certError : null
+  };
+}
+
 module.exports = {
   checkCode: checkCode,
   extractCommands: extractCommands,
   scanToolCalls: scanToolCalls,
   classifyShell: classifyShell,
   literalValue: literalValue,
+  isDeepSeekUrl: isDeepSeekUrl,
+  shellSecurityInfo: shellSecurityInfo,
   CMD_READONLY: CMD_READONLY,
   PS_READONLY: PS_READONLY
 };

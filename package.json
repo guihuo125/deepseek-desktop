@@ -1,11 +1,11 @@
 {
   "name": "deepseek-desktop",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "DeepSeek 桌面客户端",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node test/security.test.js && node test/runner.test.js && node test/preload-guard.test.js",
+    "test": "node test/security.test.js && node test/runner.test.js && node test/preload-guard.test.js && node test/shell-security.test.js",
     "build": "npm test && electron-builder --win --x64"
   },
   "author": "guihuo125",

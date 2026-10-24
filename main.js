@@ -53,18 +53,17 @@ let tray = null;
 let trayAvailable = false;   // 托盘没建起来时，关窗口必须真的退出，否则进程再也唤不回来
 let isQuitting = false;
 
-// 可信 URL 校验：只允许 https 且 hostname 为 deepseek.com 或其子域
+// 可信 URL 校验：只允许 https 且 hostname 为 deepseek.com 或其子域。
+// 判定规则本体在 security.js（与注入侧门控、地址栏三态共用同一份实现），
+// 这里只保留「解析失败必须能在日志里看到」这层包装。
 function isTrustedUrl(url) {
   try {
-    const u = new URL(url);
-    if (u.protocol !== "https:") return false;
-    const h = u.hostname.toLowerCase();
-    return h === "deepseek.com" || h.endsWith(".deepseek.com");
+    new URL(url);
   } catch (e) {
-    // 不要静默吞掉：这个函数是导航白名单，解析失败必须能在日志里看到
     console.warn("[Main] URL 解析失败，按不可信处理:", String(url).substring(0, 200), e.message);
     return false;
   }
+  return security.isDeepSeekUrl(url);
 }
 
 // ============ 权限收口 ============
@@ -93,6 +92,18 @@ function hardenPermissions(ses) {
     if (!o && wc && !wc.isDestroyed()) o = wc.getURL();
     return granted(permission, o);
   });
+}
+
+// ============ 壳层安全状态（地址栏锁图标的数据源）============
+// 三态按「对本应用的实际含义」划分，而不是只看加密与否：
+//   secure-app   https + DeepSeek 官方域 → 注入与本地执行能力启用
+//   secure-web   https + 其它站点        → 连接加密，但本应用能力已自我关闭
+//   insecure     明文 http / 证书出错     → 未加密，能力关闭
+// 判定条件与 preload.js 顶部的门控严格一致，避免两处说法不同误导用户。
+let certError = null;
+
+function securityInfo(url) {
+  return security.shellSecurityInfo(url, { workspace: currentWorkspace, certError: certError });
 }
 
 // ============ IPC 来源校验 ============
@@ -602,14 +613,33 @@ function createWindow() {
       url: wc.getURL() || HOME_URL,
       canGoBack: hist ? hist.canGoBack() : false,
       canGoForward: hist ? hist.canGoForward() : false
-    }, extra || {});
+    }, securityInfo(wc.getURL() || HOME_URL), extra || {});
     mainWindow.webContents.send("shell-state", state);
   }
 
   aiView.webContents.on("did-start-loading", () => pushShellState({ status: "loading" }));
   aiView.webContents.on("did-stop-loading", () => pushShellState({ status: "ok" }));
-  aiView.webContents.on("did-navigate", () => pushShellState());
+  aiView.webContents.on("did-navigate", () => {
+    // 换了文档，上一条证书错误不该继续挂着
+    certError = null;
+    pushShellState();
+  });
   aiView.webContents.on("did-navigate-in-page", () => pushShellState());
+
+  // 不 preventDefault —— Chromium 默认就会拒绝加载出错证书的页面，这里只把
+  // 真实原因取下来给地址栏面板显示。以前那一行「证书有效」是写死在 HTML 里的，
+  // 无论访问什么站点、无论证书怎样都显示，属于假信息。
+  aiView.webContents.on("certificate-error", (e, url, error, cert) => {
+    certError = {
+      url,
+      error: String(error || "unknown"),
+      issuer: (cert && cert.issuerName) ? String(cert.issuerName) : "",
+      subject: (cert && cert.subjectName) ? String(cert.subjectName) : "",
+      expired: !!(cert && cert.expired)
+    };
+    console.error("[shell] 证书错误:", error, url);
+    pushShellState({ status: "error" });
+  });
   aiView.webContents.on("did-fail-load", (e, code, desc) => {
     pushShellState({ status: "error" });
     console.error("[shell] 页面加载失败:", code, desc);
@@ -954,11 +984,12 @@ ipcMain.handle("get-shell-state", (event) => {
   }
   try {
     const hist = aiView.webContents.navigationHistory;
-    return {
-      url: aiView.webContents.getURL() || HOME_URL,
+    const u = aiView.webContents.getURL() || HOME_URL;
+    return Object.assign({
+      url: u,
       canGoBack: hist ? hist.canGoBack() : false,
       canGoForward: hist ? hist.canGoForward() : false
-    };
+    }, securityInfo(u));
   } catch (e) {
     return { url: HOME_URL, canGoBack: false, canGoForward: false };
   }

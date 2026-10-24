@@ -271,6 +271,8 @@ body {
 .sec-icon { width: 20px; height: 20px; flex-shrink: 0; }
 .sec-icon svg { width: 100%; height: 100%; stroke: #10b981; fill: none; }
 .sec-icon.insecure svg { stroke: #ef4444; }
+.sec-icon.neutral svg { stroke: #6b7280; }
+.sec-icon.bad svg { stroke: #ef4444; }
 .sec-title { font-weight: 600; color: var(--text-primary); }
 .sec-desc { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
 .sec-arrow { color: var(--text-tertiary); font-size: 16px; line-height: 1; }
@@ -307,25 +309,35 @@ body {
               <svg viewBox="0 0 24 24" stroke-width="2.2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
             </div>
             <div>
-              <div class="sec-title" id="sec-title-text">连接是安全的</div>
-              <div class="sec-desc">您发送给这个网站的信息（例如密码或信用卡号）不会外泄。<a href="#" style="color:#4f46e5; text-decoration:none;">了解详情</a></div>
+              <div class="sec-title" id="sec-title-text">正在读取连接状态…</div>
+              <div class="sec-desc" id="sec-desc-text"></div>
             </div>
           </div>
         </div>
         <div class="sec-item">
           <div class="sec-left">
-            <div class="sec-icon"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div>
+            <div class="sec-icon neutral" id="sec-cert-icon"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div>
             <div>
-              <div class="sec-title">证书有效</div>
+              <div class="sec-title" id="sec-cert-title">证书</div>
+              <div class="sec-desc" id="sec-cert-desc"></div>
             </div>
           </div>
         </div>
         <div class="sec-item">
           <div class="sec-left">
-            <div class="sec-icon"><svg viewBox="0 0 24 24" stroke="#6b7280" stroke-width="2"><path d="M4 7v10c0 2 1.5 3 3 3h10c1.5 0 3-1 3-3V7c0-2-1.5-3-3-3H7c-1.5 0-3 1-3 3z"/><path d="M9 3v18M15 3v18M4 12h16"/></svg></div>
+            <div class="sec-icon neutral" id="sec-cap-icon"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M12 2l7 4v6c0 5-3 8.5-7 10-4-1.5-7-5-7-10V6l7-4z"/></svg></div>
+            <div>
+              <div class="sec-title" id="sec-cap-title">本应用能力</div>
+              <div class="sec-desc" id="sec-cap-desc"></div>
+            </div>
+          </div>
+        </div>
+        <div class="sec-item">
+          <div class="sec-left">
+            <div class="sec-icon neutral"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M4 7v10c0 2 1.5 3 3 3h10c1.5 0 3-1 3-3V7c0-2-1.5-3-3-3H7c-1.5 0-3 1-3 3z"/><path d="M9 3v18M15 3v18M4 12h16"/></svg></div>
             <div>
               <div class="sec-title">Cookie 和网站数据</div>
-              <div class="sec-desc">网站会使用 Cookie 和其他数据来记住您。</div>
+              <div class="sec-desc" id="sec-cookie-desc">网站会使用 Cookie 和其他数据来记住您。</div>
             </div>
           </div>
         </div>
@@ -449,17 +461,76 @@ body {
       }, 500);
     });
 
-    // 安全面板状态更新（之前漏掉的函数）
-    function updateSecurityPanel(isSecure) {
+    // 锁图标三态。颜色之外还换形状：只靠绿/灰的话，色盲用户根本读不出差别。
+    const LOCK_ICONS = {
+      "secure-app": '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+      "secure-web": '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+      "insecure":   '<path d="M12 3L2 20h20L12 3z"/><line x1="12" y1="10" x2="12" y2="14"/><line x1="12" y1="17" x2="12.01" y2="17"/>'
+    };
+    const LOCK_COLORS = { "secure-app": "#10b981", "secure-web": "#6b7280", "insecure": "#ef4444" };
+    const SEC_TITLES = {
+      "secure-app": "已连接到 DeepSeek 官方站点",
+      "secure-web": "第三方站点，连接已加密",
+      "insecure": "连接未加密，请勿输入敏感信息"
+    };
+
+    function setText(id, v) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = v;
+    }
+    function setIconTone(id, tone) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.classList.remove("neutral", "bad", "insecure");
+      el.classList.add(tone);
+    }
+
+    // 全部字段都来自主进程的真实状态：证书那一行以前是写死在 HTML 里的
+    // 「证书有效」，任何站点都显示同一句，属于假信息。
+    function renderSecurity(state) {
+      if (!state) return;
+      const level = state.level || (state.https ? "secure-web" : "insecure");
+
+      lockEl.innerHTML = LOCK_ICONS[level] || LOCK_ICONS["secure-web"];
+      lockEl.setAttribute("stroke", LOCK_COLORS[level] || "#6b7280");
+      lockBtn.setAttribute("title", SEC_TITLES[level] || "");
+
       const iconWrap = document.getElementById("sec-icon-main");
-      const title = document.getElementById("sec-title-text");
-      if (!iconWrap || !title) return;
-      if (isSecure) {
+      if (iconWrap) {
         iconWrap.classList.remove("insecure");
-        title.textContent = "连接是安全的";
+        if (level === "insecure") iconWrap.classList.add("insecure");
+      }
+      setText("sec-title-text", SEC_TITLES[level] || "");
+      setText("sec-desc-text", state.host ? ("站点：" + state.host) : "");
+
+      if (state.certError) {
+        setIconTone("sec-cert-icon", "bad");
+        setText("sec-cert-title", "证书校验失败");
+        setText("sec-cert-desc", state.certError.error +
+          (state.certError.issuer ? ("；颁发者：" + state.certError.issuer) : ""));
+      } else if (state.https) {
+        setIconTone("sec-cert-icon", "neutral");
+        setText("sec-cert-title", "本次连接无证书错误");
+        setText("sec-cert-desc", "未收到证书错误事件；本应用不做证书链深度校验。");
       } else {
-        iconWrap.classList.add("insecure");
-        title.textContent = "连接不安全";
+        setIconTone("sec-cert-icon", "bad");
+        setText("sec-cert-title", "此连接未加密");
+        setText("sec-cert-desc", "HTTP 明文传输，路径上的任何一方都能读取或篡改内容。");
+      }
+
+      const enabled = state.capability === "enabled";
+      setIconTone("sec-cap-icon", enabled ? "neutral" : "bad");
+      if (enabled) {
+        setText("sec-cap-title", "代码执行与文件读写：已启用");
+        setText("sec-cap-desc", state.workspace
+          ? ("工作区：" + state.workspace + "（读写仅限该目录内）")
+          : "尚未选择工作区 —— 请点击左上角文件夹图标选择目录。");
+      } else if (state.capability === "disabled-third-party") {
+        setText("sec-cap-title", "代码执行与文件读写：已关闭");
+        setText("sec-cap-desc", "此处仅作浏览。注入与本地执行只在 DeepSeek 官方站点启用。");
+      } else {
+        setText("sec-cap-title", "代码执行与文件读写：已关闭");
+        setText("sec-cap-desc", "连接未加密，本地能力已全部禁用。");
       }
     }
 
@@ -468,9 +539,7 @@ body {
       if (!state) return;
       if (state.url) {
         if (!isUserEditing && inputEl.value !== state.url) inputEl.value = state.url;
-        const secure = state.url.startsWith("https://");
-        lockEl.style.stroke = secure ? "#10b981" : "#9ca3af";
-        updateSecurityPanel(secure);
+        renderSecurity(state);
       }
       btnBack.disabled = !state.canGoBack;
       btnForward.disabled = !state.canGoForward;
@@ -482,7 +551,10 @@ body {
     // 而它能补上的只有推送漏掉的极端情况 —— 换成窗口重新获得焦点时同步一次。
     window.addEventListener("focus", () => {
       window.shellAPI.getShellState().then((state) => {
-        if (state && state.url && !isUserEditing) inputEl.value = state.url;
+        if (!state) return;
+        if (state.url && !isUserEditing) inputEl.value = state.url;
+        // 失焦期间可能发生过导航，回到窗口时锁和面板都要跟上
+        renderSecurity(state);
       }).catch(() => {});
     });
 
