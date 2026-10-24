@@ -49,6 +49,8 @@ const ADDRESS_BAR_HEIGHT = 48;
 
 let mainWindow = null;   // 壳窗口（地址栏）
 let aiView = null;       // AI 网页视图（WebContentsView）
+let securityView = null; // 连接信息浮层（独立 WebContentsView，不参与网页布局）
+let securityOpen = false;
 let tray = null;
 let trayAvailable = false;   // 托盘没建起来时，关窗口必须真的退出，否则进程再也唤不回来
 let isQuitting = false;
@@ -118,6 +120,10 @@ function senderIsShell(event) {
   return !!(mainWindow && !mainWindow.isDestroyed() && event && event.sender &&
     event.sender.id === mainWindow.webContents.id);
 }
+function senderIsSecurityView(event) {
+  return !!(securityView && !securityView.webContents.isDestroyed() && event && event.sender &&
+    event.sender.id === securityView.webContents.id);
+}
 function assertTrustedSender(event) {
   if (!senderIsAiView(event) && !senderIsShell(event)) {
     throw new Error("非法的 IPC 来源");
@@ -146,7 +152,6 @@ const GLM_CONFIG_FILE = path.join(CONFIG_DIR, "glm-config.json");
 
 let currentTheme = "system";
 let resolvedTheme = "light";
-let webThemeCssKey = null;
 
 function loadThemeConfig() {
   try {
@@ -170,11 +175,17 @@ function saveThemeConfig() {
   }
 }
 
+// 页面加载完成前的过渡底色。必须与 themes/claude.css 的 --bg-canvas 一致，
+// 否则打开时会先闪一下别的颜色。
 function themeBg() {
   return resolvedTheme === "dark" ? "#262624" : "#FAF9F5";
 }
 
 function applyWindowTheme() {
+  // 关键：网页主题段（claude-web.css 的 prefers-color-scheme 深色块、GLM 面板）和
+  // dialog 都靠媒体查询判断，而不设 themeSource 时它只跟系统走 ——
+  // 用户在本应用里选「深色」却拿到一份浅色网页，就是这个断层。
+  try { nativeTheme.themeSource = currentTheme; } catch (e) {}
   const bg = themeBg();
   if (mainWindow && !mainWindow.isDestroyed()) {
     try { mainWindow.setBackgroundColor(bg); } catch (e) {}
@@ -184,82 +195,117 @@ function applyWindowTheme() {
   }
 }
 
+// ============ 网页 Claude 主题注入 ============
+// themes/claude-web.css 是给 chat.deepseek.com 用的样式表。深色段写在文件内部的
+// @media (prefers-color-scheme: dark) 里 —— Electron 的该媒体查询跟随 nativeTheme，
+// 所以整份注入一次即可，切主题不需要换文件或重注入。
+let webCssText = null;
+let webCssKey = null;
+
+function loadWebThemeCss() {
+  if (webCssText === null) {
+    try {
+      webCssText = fs.readFileSync(path.join(__dirname, "themes", "claude-web.css"), "utf-8");
+    } catch (e) {
+      // 读不到就保持网页原样，绝不能让窗口起不来
+      console.error("[Theme] 读取 themes/claude-web.css 失败，网页维持原样式:", e.message);
+      webCssText = "";
+    }
+  }
+  return webCssText;
+}
+
+// 网页字体：claude-web.css 里只有 font-family，刻意没写 @font-face —— 相对路径在
+// 远端页面上解析不到 asar，file:// 会被隐私拦截，data: 又受页面 CSP 的 font-src 管。
+// FontFace(字节) 不产生任何资源请求，CSP 无从拦截，字体照样注册进这个 document。
+const WEB_FONTS = [
+  { family: "Inter", weight: "100 900", file: "inter-normal-variable.woff2" },
+  { family: "Source Serif 4", weight: "200 900", file: "source-serif-4-variable.woff2" },
+];
+let webFontJsText;   // undefined=未读，null=不可用
+
+function webFontJs() {
+  if (webFontJsText !== undefined) return webFontJsText;
+  const list = [];
+  for (const f of WEB_FONTS) {
+    try {
+      const buf = fs.readFileSync(path.join(__dirname, "assets", "fonts", f.file));
+      list.push({ family: f.family, weight: f.weight, b64: buf.toString("base64") });
+    } catch (e) {
+      console.warn(`[Theme] 字体 ${f.file} 读取失败，网页回退系统字体:`, e.message);
+    }
+  }
+  webFontJsText = list.length
+    ? `(async()=>{for(const f of ${JSON.stringify(list)}){try{` +
+      `const b=Uint8Array.from(atob(f.b64),c=>c.charCodeAt(0));` +
+      `const ff=new FontFace(f.family,b.buffer,{weight:f.weight,display:"swap"});` +
+      `await ff.load();document.fonts.add(ff);}catch(e){}}return 1})()`
+    : null;
+  return webFontJsText;
+}
+
+// dom-ready 与 did-finish-load 可能几乎同时到达，并发执行会各插一份却只记住最后
+// 一个 key，前一份永远删不掉。用 promise 链串行化，并用 key 做幂等。
+let webCssChain = Promise.resolve();
+function applyWebTheme(force) {
+  webCssChain = webCssChain
+    .then(() => applyWebThemeNow(force))
+    .catch((e) => console.warn("[Theme] 注入失败:", e.message));
+  return webCssChain;
+}
+
+async function applyWebThemeNow(force) {
+  if (!aiView || aiView.webContents.isDestroyed()) return;
+  if (webCssKey && !force) return;          // 本文档已注入过
+  if (webCssKey) {
+    await aiView.webContents.removeInsertedCSS(webCssKey).catch(() => {});
+    webCssKey = null;
+  }
+  // 与 preload.js 的注入门控同源：只在官方 https 页面改外观。
+  // 第三方站点被我们改样式既越界，也会让「能力已关闭」的页面看起来仍被接管。
+  if (!isTrustedUrl(aiView.webContents.getURL())) return;
+  const css = loadWebThemeCss();
+  if (!css) return;
+  // cssOrigin:"user" 只决定我们站在「用户」这一档，不自动获得优先级：
+  // 普通声明的层叠顺序是【作者 > 用户 > UA】，页面自己的普通声明照样压得住我们。
+  // 所以 themes/claude-web.css 里接管令牌与字体族的那批声明必须逐条 !important
+  // （important 侧才反过来：用户 > 作者）。别因为"我们是 user origin"就删掉它们。
+  // 先插 CSS 再装字体：字体那段要传 ~230KB base64 并等 FontFace.load()，
+  // 放在前面会把首屏上色一起拖住；颜色不依赖字体，先落地。
+  webCssKey = await aiView.webContents.insertCSS(css, { cssOrigin: "user" });
+  const js = webFontJs();
+  if (js) {
+    await aiView.webContents.executeJavaScript(js).catch((e) => {
+      console.warn("[Theme] 字体注入失败，网页回退系统字体:", e.message);
+    });
+  }
+}
+
 function broadcastTheme() {
   const payload = { theme: currentTheme, resolved: resolvedTheme };
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("theme-changed", payload);
   }
-  if (aiView && !aiView.webContents.isDestroyed()) {
-    aiView.webContents.send("theme-changed", payload);
+  // 浮层是独立文档，自己不跟 nativeTheme，需要单独收一份解析后的主题
+  if (securityOpen && securityView && !securityView.webContents.isDestroyed()) {
+    securityView.webContents.send("theme-changed", payload);
   }
+  // 不往 aiView 发明文：那边没有监听者，网页主题由 nativeTheme 驱动的
+  // prefers-color-scheme 自己跟随，多发一条只是死 IPC。
   applyWindowTheme();
-  applyWebThemeCss();
+  // ★ 这里【不要】重新注入网页样式表。深色段是靠文件内的 prefers-color-scheme 与
+  //   body.dark 两段令牌自动跟随的，换主题不需要换文件。
+  //   而且 removeInsertedCSS 对 cssOrigin:"user" 插入的表并不生效（实测：每调一次
+  //   force 重注入，页面里就多留一份样式表，切两次主题后同一批规则匹配到 4 份，
+  //   样式重算成本直接乘倍）。所以一个文档只注入一次：dom-ready 负责，
+  //   did-finish-load 兜底（key 为空时才会真的插）。
 }
 
-// dom-ready 与 did-finish-load 都会调进来，两者可能几乎同时到达：并发执行时各自
-// insertCSS 一次，却只记得最后一个 key，前一条永远删不掉（每次导航累积一条残留
-// 样式）。用 promise 链把它串行化。
-let themeCssChain = Promise.resolve();
-function applyWebThemeCss() {
-  themeCssChain = themeCssChain
-    .then(applyWebThemeCssNow)
-    .catch((e) => console.warn("[Theme] 注入失败:", e.message));
-  return themeCssChain;
-}
 
-async function applyWebThemeCssNow() {
-  if (!aiView || aiView.webContents.isDestroyed()) return;
-  try {
-    if (webThemeCssKey) {
-      await aiView.webContents.removeInsertedCSS(webThemeCssKey).catch(() => {});
-      webThemeCssKey = null;
-    }
-    // 下面两套 CSS 里有 html, body { background: … !important } 这种全局规则，
-    // 且选择器是按 DeepSeek 的 DOM 写的。地址栏现在能打开任意站点，注入过去
-    // 会把别人的配色整个改坏，所以只对 DeepSeek 生效。
-    if (!isTrustedUrl(aiView.webContents.getURL())) return;
-    const css = resolvedTheme === "dark" ? WEB_THEME_DARK : WEB_THEME_LIGHT;
-    webThemeCssKey = await aiView.webContents.insertCSS(css, { cssOrigin: "user" });
-  } catch (e) {
-    console.warn("[Theme] 注入失败:", e.message);
-  }
-}
-
-// ============ 网页主题 CSS（最小侵入）============
-const WEB_THEME_LIGHT = `
-html, body { background: #FAF9F5 !important; color: #1F1E1D !important; }
-[role="navigation"], aside, body > div > div > div:first-child { background: #FAF9F5 !important; }
-[role="navigation"] a:hover, [role="navigation"] div[role="button"]:hover, aside a:hover { background: #F0EEE6 !important; }
-textarea { background: #FFFFFF !important; color: #1F1E1D !important; caret-color: #C15F3C !important; }
-textarea::placeholder { color: #9A9890 !important; }
-div:has(> textarea) { background: #FFFFFF !important; border-color: #E5E3DA !important; box-shadow: none !important; }
-div:has(> textarea):focus-within { border-color: #C15F3C !important; box-shadow: 0 0 0 2px rgba(193,95,60,0.12) !important; }
-[class*="input-container"], [class*="chat-input"] { background: #FFFFFF !important; border-color: #E5E3DA !important; box-shadow: none !important; }
-[class*="user"] [class*="message"], [class*="user"] [class*="bubble"], [class*="user"][class*="bubble"] { background: #F0EEE6 !important; color: #1F1E1D !important; box-shadow: none !important; }
-[class*="assistant"] [class*="message"], [class*="ai-message"], [class*="bot-message"] { background: #F7F6F2 !important; color: #1F1E1D !important; box-shadow: none !important; }
-button[aria-label]:hover { background: #F0EEE6 !important; }
-h1, h2 { color: #1F1E1D !important; font-weight: 500 !important; }
-`;
-
-const WEB_THEME_DARK = `
-html, body { background: #262624 !important; color: #F5F4EF !important; }
-[role="navigation"], aside, body > div > div > div:first-child { background: #262624 !important; }
-[role="navigation"] a:hover, [role="navigation"] div[role="button"]:hover, aside a:hover { background: #3A3835 !important; }
-textarea { background: #2F2E2B !important; color: #F5F4EF !important; caret-color: #E08C6A !important; }
-textarea::placeholder { color: #8A877D !important; }
-div:has(> textarea) { background: #2F2E2B !important; border-color: #3D3B37 !important; box-shadow: none !important; }
-div:has(> textarea):focus-within { border-color: #E08C6A !important; box-shadow: 0 0 0 2px rgba(224,140,106,0.15) !important; }
-[class*="input-container"], [class*="chat-input"] { background: #2F2E2B !important; border-color: #3D3B37 !important; box-shadow: none !important; }
-[class*="user"] [class*="message"], [class*="user"] [class*="bubble"], [class*="user"][class*="bubble"] { background: #3A3835 !important; color: #F5F4EF !important; box-shadow: none !important; }
-[class*="assistant"] [class*="message"], [class*="ai-message"], [class*="bot-message"] { background: #2A2927 !important; color: #F5F4EF !important; box-shadow: none !important; }
-button[aria-label]:hover { background: #3A3835 !important; }
-h1, h2 { color: #F5F4EF !important; font-weight: 500 !important; }
-pre, code { background: #1A1918 !important; color: #E8E5DB !important; border-color: #3D3B37 !important; }
-img, video, svg[role="img"] { filter: none !important; }
-::-webkit-scrollbar-thumb { background: #4A4843 !important; border-radius: 6px; }
-::-webkit-scrollbar-track { background: transparent !important; }
-input, textarea, [contenteditable] { caret-color: #E08C6A !important; }
-`;
+// ============ 面板让位 ============
+// 壳层面板展开时由 shell.html 报一次：哪一侧、让多宽。0 表示收回。
+let viewInset = { side: null, width: 0 };
+let layoutViewRef = null;
 
 // ============ 窗口状态 ============
 function loadWindowState() {
@@ -505,6 +551,59 @@ function formatExecutionError(result, rawCode) {
   return lines.join("\n").substring(0, 12000);
 }
 
+// ============ 连接信息浮层 ============
+// 尺寸 = 卡片 330/288 + 四周 16px 阴影留白。view 是矩形而不是卡片形状，
+// 所以窗口边缘要 clamp 住，别让浮层跑出可视区。
+const SECURITY_VIEW_W = 362;
+const SECURITY_VIEW_H = 320;
+
+function currentSecurityState() {
+  const u = aiView && !aiView.webContents.isDestroyed()
+    ? (aiView.webContents.getURL() || HOME_URL)
+    : HOME_URL;
+  return Object.assign({ url: u }, securityInfo(u));
+}
+
+function placeSecurityView(anchorX) {
+  if (!mainWindow || mainWindow.isDestroyed() || !securityView) return;
+  const [w, h] = mainWindow.getContentSize();
+  const width = Math.min(SECURITY_VIEW_W, Math.max(0, w - 16));
+  const height = Math.min(SECURITY_VIEW_H, Math.max(0, h - ADDRESS_BAR_HEIGHT - 12));
+  // 卡片自带 16px 内边距：view.x 比锚点少 16，卡片左边才和锁图标对齐
+  const anchor = Number.isFinite(Number(anchorX)) ? Number(anchorX) : 16;
+  const x = Math.max(8, Math.min(anchor - 16, w - width - 8));
+  securityView.setBounds({ x, y: ADDRESS_BAR_HEIGHT + 6, width, height });
+}
+
+function pushSecurityState() {
+  if (!securityOpen || !securityView || securityView.webContents.isDestroyed()) return;
+  securityView.webContents.send("security-state", currentSecurityState());
+}
+
+function openSecurityPanel(anchorX) {
+  if (!securityView || securityView.webContents.isDestroyed()) return;
+  placeSecurityView(anchorX);
+  securityOpen = true;
+  securityView.setVisible(true);
+  pushSecurityState();
+  // 浮层文档只在加载时拉过一次主题。如果它关着的时候用户切了主题，
+  // 现在打开就会拿到旧色（实测深色下开出来一张浅色卡片），所以每次打开补发。
+  securityView.webContents.send("theme-changed", { theme: currentTheme, resolved: resolvedTheme });
+  securityView.webContents.send("security-open");
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("security-panel-state", true);
+  }
+}
+
+function closeSecurityPanel() {
+  if (!securityOpen) return;
+  securityOpen = false;
+  if (securityView && !securityView.webContents.isDestroyed()) securityView.setVisible(false);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("security-panel-state", false);
+  }
+}
+
 // ============ 创建主窗口 ============
 function createWindow() {
   const state = loadWindowState();
@@ -547,25 +646,62 @@ function createWindow() {
 
   mainWindow.contentView.addChildView(aiView);
 
+  // === 2.5 连接信息浮层 ===
+  // 以前这块是 shell.html 里的 DOM。壳层是窗口的底层 webContents，而 aiView
+  // 是盖在它上面的原生视图 —— 要看见面板就必须把网页缩窄让位，代价是正文列
+  // 每次开合都被推走。改成独立 WebContentsView 后，它只占地址栏下方一小块
+  // 矩形，浮在 aiView 之上，网页几何完全不动。
+  securityView = new WebContentsView({
+    webPreferences: {
+      preload: path.join(__dirname, "security-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      devTools: IS_DEV
+    }
+  });
+  try { securityView.setBackgroundColor("#00000000"); } catch (e) {}
+  securityView.setVisible(false);
+  mainWindow.contentView.addChildView(securityView);
+  securityView.webContents.loadFile(path.join(__dirname, "security.html"));
+  // 本地浮层永远不需要跳转或开新窗口：关掉，免得将来有人往里面塞链接。
+  securityView.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  securityView.webContents.on("will-navigate", (e) => e.preventDefault());
+  securityView.webContents.on("did-finish-load", () => {
+    if (securityOpen) pushSecurityState();
+  });
+
   function layoutView() {
     if (!mainWindow || mainWindow.isDestroyed() || !aiView) return;
     const [w, h] = mainWindow.getContentSize();
+    // 壳层的设置/安全面板是 shell.html 里的 DOM，而 aiView 是盖在它上面的原生视图：
+    // 面板从 48px 的顶栏往下长，不腾出这块就永远被网页遮住。腾的方式是横向让位，
+    // 让网页缩到面板对面那一侧，跟网页自己重排一次，代价只在开合各一次。
+    const inset = viewInset.width ? Math.min(viewInset.width, Math.max(0, w - 480)) : 0;
     aiView.setBounds({
-      x: 0,
+      x: viewInset.side === "left" ? inset : 0,
       y: ADDRESS_BAR_HEIGHT,
-      width: w,
+      width: Math.max(0, w - inset),
       height: Math.max(0, h - ADDRESS_BAR_HEIGHT)
     });
   }
   layoutView();
+  layoutViewRef = layoutView;
   mainWindow.on("resize", layoutView);
+  mainWindow.on("resize", closeSecurityPanel);
+  // 浮层只在本窗口内有效：点网页、换页、窗口尺寸变化都该收起，
+  // 否则它会漂在错误的位置上。
+  aiView.webContents.on("focus", closeSecurityPanel);
+  // 壳层重载后 DOM 里的面板状态全丢了，让位必须一起归零，
+  // 否则网页会一直缺着一条再也收不回来的边。
+  mainWindow.webContents.on("did-navigate", () => {
+    viewInset = { side: null, width: 0 };
+    closeSecurityPanel();
+    layoutView();
+  });
 
   try { aiView.setBackgroundColor(themeBg()); } catch (e) {}
   aiView.webContents.loadURL(HOME_URL);
 
-  // === 3. 主题注入 ===
-  aiView.webContents.on("dom-ready", () => { applyWebThemeCss(); });
-  aiView.webContents.on("did-finish-load", () => { applyWebThemeCss(); });
 
   // === 4. probe hook（默认关闭）===
   // probe.js 会 hook 页面所有 XHR 并把整段 AI 回复在页面内存里再攒一份，
@@ -615,6 +751,7 @@ function createWindow() {
       canGoForward: hist ? hist.canGoForward() : false
     }, securityInfo(wc.getURL() || HOME_URL), extra || {});
     mainWindow.webContents.send("shell-state", state);
+    pushSecurityState();
   }
 
   aiView.webContents.on("did-start-loading", () => pushShellState({ status: "loading" }));
@@ -622,8 +759,16 @@ function createWindow() {
   aiView.webContents.on("did-navigate", () => {
     // 换了文档，上一条证书错误不该继续挂着
     certError = null;
+    // user CSS 随文档一起失效，key 必须清掉，
+    // 否则新文档上会被误判成「已注入过」而永久丢样式
+    webCssKey = null;
     pushShellState();
   });
+
+  // 主题注入：dom-ready 尽早生效（减少原色闪现）；
+  // did-finish-load 只在漏注时补一次，避免每次导航两趟 insertCSS 往返
+  aiView.webContents.on("dom-ready", () => { applyWebTheme(true); });
+  aiView.webContents.on("did-finish-load", () => { applyWebTheme(false); });
   aiView.webContents.on("did-navigate-in-page", () => pushShellState());
 
   // 不 preventDefault —— Chromium 默认就会拒绝加载出错证书的页面，这里只把
@@ -815,7 +960,8 @@ function showDangerDialog(reasons) {
         skipTaskbar: true,
         alwaysOnTop: true,
         show: false,
-        backgroundColor: "#ffffff",
+        // 与 --bg-canvas 同值，避免弹窗出现时先闪一下白底
+        backgroundColor: themeBg(),
         webPreferences: {
           preload: path.join(__dirname, "dialog-preload.js"),
           additionalArguments: ["--dialog-data=" +
@@ -864,7 +1010,9 @@ function showDangerDialog(reasons) {
       }
     });
 
-    dialogWin.loadFile(path.join(__dirname, "dialog.html"));
+    // 深色段挂在 [data-theme="dark"] 上。弹窗是独立窗口，拿不到 shell 那条主题
+    // IPC，所以把已解析好的档位随 URL query 一起交给页面 —— 不开新通道、不动 preload。
+    dialogWin.loadFile(path.join(__dirname, "dialog.html"), { query: { theme: resolvedTheme } });
     dialogWin.once("ready-to-show", () => {
       try {
         dialogWin.show();
@@ -976,6 +1124,46 @@ ipcMain.handle("select-workspace", async (event) => {
   return { path: currentWorkspace };
 });
 
+// ============ 设置页：系统能力 ============
+// 这些都能改本机状态，一律只认壳层。远程页面即使拿到 channel 名也发不进来。
+ipcMain.handle("get-app-info", (event) => {
+  if (!senderIsShell(event)) return { version: "", electron: "" };
+  return { version: app.getVersion(), electron: process.versions.electron };
+});
+
+ipcMain.handle("open-workspace-folder", async (event) => {
+  if (!senderIsShell(event)) return { ok: false, error: "非法的 IPC 来源" };
+  if (!currentWorkspace) return { ok: false, error: "尚未选择工作区" };
+  const err = await shell.openPath(currentWorkspace);
+  return err ? { ok: false, error: err } : { ok: true };
+});
+
+ipcMain.handle("get-login-item", (event) => {
+  if (!senderIsShell(event)) return { openAtLogin: false };
+  try { return { openAtLogin: app.getLoginItemSettings().openAtLogin }; } catch (e) { return { openAtLogin: false }; }
+});
+
+ipcMain.handle("set-login-item", (event, enabled) => {
+  if (!senderIsShell(event)) return { ok: false, error: "非法的 IPC 来源" };
+  try {
+    app.setLoginItemSettings({ openAtLogin: !!enabled });
+    return { ok: true, openAtLogin: app.getLoginItemSettings().openAtLogin };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle("clear-cache", async (event) => {
+  if (!senderIsShell(event)) return { ok: false, error: "非法的 IPC 来源" };
+  try {
+    await session.defaultSession.clearCache();
+    if (aiView && !aiView.webContents.isDestroyed()) aiView.webContents.reload();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
 // ============ 壳页面状态查询 ============
 ipcMain.handle("get-shell-state", (event) => {
   try { assertTrustedSender(event); } catch (e) { return { url: HOME_URL, canGoBack: false, canGoForward: false }; }
@@ -1049,6 +1237,38 @@ nativeTheme.on("updated", () => {
     resolvedTheme = next;
     broadcastTheme();
   }
+});
+
+// preload 跑在 sandbox 里，不能 require("./package.json")，元信息只能由主进程给。
+// 同步应答是因为 preload 在脚本顶层就要拿到它（晚一步就来不及暴露给页面）。
+ipcMain.on("get-preload-meta", (event) => {
+  const ok = senderIsAiView(event) || senderIsShell(event);
+  event.returnValue = ok
+    ? { version: app.getVersion(), platform: process.platform }
+    : { version: "", platform: "" };
+});
+
+// 壳层面板展开时申请让位：side = "left" | "right" | "none"，width 像素。
+// 改的是原生视图的几何，只有壳层自己能发起，且宽度设了硬上限。
+ipcMain.on("set-panel-inset", (event, side, width) => {
+  // 收紧到只认壳层：这条会改原生视图几何，远程页面不该有任何途径碰它
+  if (!senderIsShell(event)) return;
+  const w = Number(width);
+  if (!Number.isFinite(w) || w < 0 || w > 720) return;
+  viewInset = (side === "left" || side === "right") && w > 0 ? { side, width: w } : { side: null, width: 0 };
+  if (layoutViewRef) layoutViewRef();
+});
+
+// 连接信息浮层：壳层只发「开/关」与锚点坐标，几何由主进程算，
+// 这样远程页面没有任何入口能移动或隐藏原生层。
+ipcMain.on("toggle-security-panel", (event, anchorX) => {
+  if (!senderIsShell(event)) return;
+  if (securityOpen) closeSecurityPanel();
+  else openSecurityPanel(anchorX);
+});
+ipcMain.on("close-security-panel", (event) => {
+  if (!senderIsShell(event) && !senderIsSecurityView(event)) return;
+  closeSecurityPanel();
 });
 
 // ============ GLM API Key 安全存储 ============
@@ -1387,6 +1607,10 @@ app.on("second-instance", () => { showWindow(); });
 
 app.whenReady().then(async () => {
   loadThemeConfig();
+  // 必须在任何页面加载前把 themeSource 定下来：网页深色段走的是
+  // prefers-color-scheme，它跟随 nativeTheme 而不是我们的 theme.json。
+  // 少这一次调用，冷启动就会出现"深壳浅页"（上次只在本轮切主题时设过）。
+  applyWindowTheme();
 
   Menu.setApplicationMenu(null);
 

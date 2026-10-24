@@ -136,6 +136,33 @@ for (const h of ["", "undefined"]) {
   ok(r.exposed.length === 0 && r.ipcOnCalls === 0, `不注入: hostname="${h}"`);
 }
 
+console.log("\n== 自动执行不再有人为次数上限 ==");
+// 用户明确要求取消「单链最多自动执行 3 次」。白名单分级与危险确认仍是硬边界，
+// 这里只守住配额机制没有被无意恢复。
+const srcCode = SRC.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+ok(!/MAX_CHAIN/.test(srcCode), "没有 MAX_CHAIN 常量");
+ok(!/自动执行上限/.test(srcCode), "不再注入「已达自动执行上限」提示");
+ok(!/autoChain/.test(srcCode), "没有自动执行链计数残留");
+
+console.log("\n== 历史会话不得重放旧代码块 ==");
+// 打开应用即可落在某个历史会话上；切会话时也会整段重渲染。旧实现把这些
+// 历史代码块当新块，会重新自动执行（实测直接弹「AI 请求执行危险操作」）。
+// 只靠时间窗不够：消息列表虚拟化，历史块滚到才挂载，可能几秒后才出现。
+ok(/HISTORY_GUARD_MS\s*=\s*\d+/.test(srcCode), "有历史静默窗常量");
+ok(/historyGuardUntil\s*=\s*Date\.now\(\)\s*\+\s*HISTORY_GUARD_MS/.test(srcCode),
+  "打开应用与切换会话时都开启静默窗");
+ok(/lastUserActionAt\s*=\s*0/.test(srcCode), "切会话会清掉本次请求标记");
+const histFn = (srcCode.match(/function isHistoricalBlock\(pre\) \{[\s\S]*?\n\}/) || [""])[0];
+ok(/Date\.now\(\) < historyGuardUntil/.test(histFn), "静默窗内的块算历史");
+ok(/lastUserActionAt/.test(histFn), "没有「用户发过消息」信号时算历史");
+ok(/all\[all\.length - 1\] !== msgEl/.test(histFn), "不在最后一条消息里的块算历史");
+const histBranch = (srcCode.match(/if \(isHistoricalBlock\(pre\)\) \{[\s\S]*?\n  \}/) || [""])[0];
+ok(/markProcessed\(pre, id\)/.test(histBranch) && /markProcessed\(null, codeKey\)/.test(histBranch),
+  "历史块按元素与内容双重记账");
+ok(/injectButton\(pre, codeText, id/.test(histBranch), "历史块只保留手动执行入口");
+ok(!/scheduleExecute/.test(histBranch), "历史块不进入自动执行调度");
+ok(/function codeKeyFor\(code\)/.test(srcCode), "有跨渲染的内容哈希去重");
+
 console.log("\n==================================================");
 if (failed === 0) console.log(`全部通过（${passed} 项）`);
 else { console.log(`失败 ${failed} 项 / 通过 ${passed} 项`); process.exit(1); }

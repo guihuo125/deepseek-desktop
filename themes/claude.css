@@ -1,0 +1,222 @@
+/* ============================================================================
+   Claude 风格主题 —— 全应用唯一设计源
+   ----------------------------------------------------------------------------
+   壳层（shell.html）、危险弹窗（dialog.html）、GLM 面板（preload.js 注入）、
+   DeepSeek 页面（main.js 注入 themes/claude-web.css）都引用这里的同名变量。
+   改配色只改这一个文件，不要在各页面里另写色值。
+
+   色板取自 Anthropic / Claude 公开的品牌规范。核心特征是「几乎不用纯白纯黑」：
+   所有中性色都向暖色偏几度，读起来像纸而不是屏幕。
+   ========================================================================== */
+
+/* ===== 字体 =====
+   Claude 原文用 Styrene（标题）与 Tiempos（正文），两者均为商业授权，
+   不能随安装包分发。这里用气质一致的开源替代（SIL OFL，可商用）：
+     Source Serif 4 —— 对应 Tiempos，衬线，用于**标题与展示文字**（书卷气）
+     Inter          —— 对应 Styrene，无衬线，用于**正文、控件、菜单**
+   注意分工：Claude 是「衬线标题 + 无衬线正文」，不要反过来。
+   中文不嵌入字体（思源系列单套 10 MB 以上，会明显拖慢启动），
+   走系统字体栈：Latin 由上面两款接管，中日韩自动回退到系统中文字体。 */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('../assets/fonts/inter-normal-variable.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+                 U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+                 U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Source Serif 4';
+  font-style: normal;
+  font-weight: 200 900;
+  font-display: swap;
+  src: url('../assets/fonts/source-serif-4-variable.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+                 U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+                 U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ===== 浅色（默认）===== */
+:root,
+[data-theme="light"] {
+  /* 表面：从外到内逐级提亮，靠色差分层而不是阴影 */
+  --bg-canvas:   #FAF9F5;   /* Ivory   页面最底 */
+  --bg-surface:  #FDFCFA;   /* 近白    卡片、弹层（刻意不是 #FFF）*/
+  --bg-subtle:   #F0EEE6;   /* Oat     次级面板、hover 底 */
+  --bg-raised:   #E8E6DE;   /* Oat 深  按下态、选中底 */
+  --bg-address:  #F5F4EF;   /* 地址栏专用 */
+  --bg-inverse:  #141413;   /* Ink     反白块、tooltip */
+
+  /* 文字 */
+  --text-primary:   #141413;
+  --text-secondary: #5E5D59;
+  --text-tertiary:  #83827D;
+  --text-disabled:  #B0AEA5;   /* Mid gray */
+  --text-inverse:   #FAF9F5;
+
+  /* 描边：Claude 的分层主要靠 1px 暖色描边，不靠投影 */
+  --border-default: #E3DACC;   /* Sand  常规分隔 */
+  --border-strong:  #D1CFC5;   /* Border 输入框、卡片边 */
+  --border-focus:   #C9C7BE;
+
+  /* 强调色 */
+  --accent:        #D97757;   /* Claude 主强调（按钮、链接、光标）*/
+  --accent-hover:  #C15F3C;
+  --accent-active: #A94E2E;
+  --accent-soft:   #F5E5DE;   /* 强调色的浅底，用于选中项、tag */
+  --accent-text:   #B0491F;   /* 浅底上的强调文字，保证对比度 */
+
+  /* 辅助色（克制使用）*/
+  --blue:  #6A9BCC;
+  --green: #788C5D;
+  --danger: #B33D3D;
+  --danger-soft: #F7E8E6;
+
+  /* 阴影：极淡，只用于浮层脱离页面 */
+  --shadow-sm: 0 1px 2px rgba(20, 20, 19, 0.04);
+  --shadow-md: 0 4px 16px rgba(20, 20, 19, 0.06);
+  --shadow-lg: 0 12px 40px rgba(20, 20, 19, 0.10);
+
+  /* 滚动条 */
+  --scroll-thumb: #D1CFC5;
+  --scroll-track: transparent;
+}
+
+/* ===== 深色 =====
+   同样偏暖：底不是 #000 也不是冷灰，而是带黄褐的深灰。 */
+[data-theme="dark"] {
+  --bg-canvas:   #262624;
+  --bg-surface:  #2F2E2B;
+  --bg-subtle:   #3A3835;
+  --bg-raised:   #454340;
+  --bg-address:  #2A2927;
+  --bg-inverse:  #F5F4EF;
+
+  --text-primary:   #F5F4EF;
+  --text-secondary: #B8B4A8;
+  --text-tertiary:  #8A877D;
+  --text-disabled:  #6B6963;
+  --text-inverse:   #141413;
+
+  --border-default: #3D3B37;
+  --border-strong:  #4A4843;
+  --border-focus:   #5C5A54;
+
+  --accent:        #E08C6A;
+  --accent-hover:  #F09C7A;
+  --accent-active: #C97656;
+  --accent-soft:   #3D2E27;
+  --accent-text:   #EDA987;
+
+  --blue:  #7FA9D4;
+  --green: #93A878;
+  --danger: #D97757;
+  --danger-soft: #43241F;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.30);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.40);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.55);
+
+  --scroll-thumb: #4A4843;
+  --scroll-track: transparent;
+}
+
+/* ===== 排版 ===== */
+:root {
+  --font-ui:     'Inter', -apple-system, 'Segoe UI', 'Microsoft YaHei',
+                 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+  --font-serif:  'Source Serif 4', Georgia, 'Times New Roman',
+                 'Songti SC', 'SimSun', serif;
+  --font-mono:   'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+
+  /* Claude 的标题偏紧、正文偏松 */
+  --tracking-tight: -0.02em;
+  --leading-body:   1.65;
+
+  --text-xs: 11px;
+  --text-sm: 12.5px;
+  --text-md: 14px;
+  --text-lg: 15px;
+  --text-xl: 17px;
+  --text-2xl: 21px;
+}
+
+/* ===== 形状与间距 =====
+   圆角比常见 UI 更大一档（Claude 的卡片明显圆润），
+   但按钮保持中等，避免显得幼稚。 */
+:root {
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 28px;
+}
+
+/* ===== 动效 =====
+   Claude 的过渡特征是「短、缓出、无回弹」。曲线固定用下面两条，
+   时长克制：超过 260ms 就会显得拖沓。
+   所有动效只做 transform / opacity，避免 layout 抖动。 */
+:root {
+  --ease-out:  cubic-bezier(0.16, 1, 0.30, 1);   /* 主曲线：快进慢停 */
+  --ease-soft: cubic-bezier(0.32, 0.72, 0, 1);   /* 面板、抽屉 */
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 260ms;
+}
+
+/* 尊重系统的减少动效偏好 —— 无障碍与性能都受益 */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ===== 质感层 =====
+   Claude 的底不是平涂：纸面有极淡颗粒，顶部有一层暖色回落。三个工具类都做成
+   「可选叠加」而不是全局背景，因为整页重复的噪点会多出一个合成层，
+   对滚动性能有影响，而 0.045 的不透明度在 99% 的面积上根本看不见。 */
+:root {
+  /* 140×140 无缝灰噪，自带 opacity，不需要 mix-blend-mode（混合模式会强制独立图层） */
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.045'/%3E%3C/svg%3E");
+  --wash: radial-gradient(1100px 520px at 50% -12%,
+          color-mix(in srgb, var(--accent) 7%, transparent), transparent 68%);
+}
+
+[data-theme="dark"] {
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+  --wash: radial-gradient(1100px 520px at 50% -12%,
+          color-mix(in srgb, var(--accent) 10%, transparent), transparent 68%);
+}
+
+.claude-wash { background-image: var(--wash); }
+
+/* 只给块级、有定位上下文的容器加 .claude-grain：伪元素铺满并继承圆角 */
+.claude-grain { position: relative; }
+.claude-grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background-image: var(--grain);
+  pointer-events: none;
+}
+
+/* 装饰横线：两端淡出，用来替代硬分隔线 */
+.claude-rule {
+  height: 1px;
+  border: 0;
+  background: linear-gradient(90deg, transparent,
+              var(--border-strong) 18%, var(--border-strong) 82%, transparent);
+}

@@ -1,11 +1,11 @@
 ; ==============================================
-; DeepSeek 桌面客户端 安装脚本 v1.4.0
+; DeepSeek 桌面客户端 安装脚本 v1.6.1
 ; 全中文界面 + 优化安装体验
 ; ==============================================
 
 #define MyAppName "DeepSeek"
 #define MyAppNameCN "DeepSeek 桌面客户端"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.6.10"
 #define MyAppPublisher "DeepSeek"
 #define MyAppExeName "DeepSeek.exe"
 

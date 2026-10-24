@@ -22,14 +22,20 @@ if (__proto !== "https:" || (__host !== "deepseek.com" && !__host.endsWith(".dee
 // 但页面里没有任何代码调用它们 —— 全部由本文件的 preload 代码直接用 ipcRenderer 完成。
 // 把它们暴露给 chat.deepseek.com 这个远程上下文，等于给一次 DeepSeek 端 XSS
 // 递上「读本地任意文件 + 改写 GLM API Key」的能力，收益为零、风险极高。
+//
+// ★ 版本号不能用 require("./package.json")：aiView 的 preload 跑在 sandbox 里，
+//   sandbox_bundle 的 require 只认 electron 一类内置模块，require 本地文件会让
+//   整份 preload 加载失败（渲染进程日志：module not found: ./package.json）。
+//   症状是注入层整体静默消失 —— GLM 面板、代码块执行、主题打标全都不存在，
+//   而页面看起来完全正常，所以必须走 IPC 拿。
+var __meta = {};
+try { __meta = ipcRenderer.sendSync("get-preload-meta") || {}; } catch (e) {}
 contextBridge.exposeInMainWorld("deepseekDesktop", {
-  version: require("./package.json").version,
-  platform: process.platform
+  version: __meta.version || "",
+  platform: __meta.platform || process.platform
 });
 
 // ============ 状态 ============
-var autoChain = 0;              // 当前自动执行链的计数（只有自动执行消耗配额，手动点击不算）
-var MAX_CHAIN = 3;              // 单链最多自动执行 3 次
 var pendingBlocks = {};         // { id: { code, block, timer } }
 
 // 已处理过的代码块。
@@ -43,6 +49,14 @@ var MAX_PROCESSED_IDS = 300;
 // 只扫正在变化的 <pre>，不再每 2 秒全量扫 document.body
 var activePres = new Set();
 var scanTimer = null;
+// 历史消息识别：打开应用/切回旧会话时，页面上的 cuckoo 块是过去 AI 的回复，
+// 只标记为已处理并提供手动入口，绝不自动重放（用户实测：打开历史会话会弹危险确认）。
+// 光靠时间窗不够——DeepSeek 的消息列表是虚拟化的，历史块滚到才挂载，
+// 往往在几秒后才出现。所以要同时看「用户最近是否真的发过消息」和「块是不是最后一条回复」。
+var HISTORY_GUARD_MS = 5000;
+var historyGuardUntil = 0;
+var USER_ACTION_WINDOW_MS = 30 * 60 * 1000;
+var lastUserActionAt = 0;
 var __stylesInjected = false;
 
 function markProcessed(block, id) {
@@ -52,6 +66,25 @@ function markProcessed(block, id) {
     // 只淘汰最旧的一条，不整表清空
     processedIds.delete(processedIds.keys().next().value);
   }
+}
+
+// 相同代码在同一会话里只自动执行一次；换会话可以重新执行。
+function codeKeyFor(code) {
+  var h = 5381;
+  for (var i = 0; i < code.length; i++) h = ((h << 5) + h + code.charCodeAt(i)) >>> 0;
+  return "h:" + (location.pathname || "") + ":" + h.toString(36);
+}
+
+// 判定「这是历史回复，不是本次请求的回复」。
+// 三个条件任一成立就算历史：刚打开/切会话的静默窗内、用户近期没发过消息、
+// 块不在最后一条消息里（虚拟列表滚出来的中间消息）。
+function isHistoricalBlock(pre) {
+  if (Date.now() < historyGuardUntil) return true;
+  if (!lastUserActionAt || Date.now() - lastUserActionAt > USER_ACTION_WINDOW_MS) return true;
+  var msgEl = pre.closest && pre.closest(".ds-message");
+  if (!msgEl) return true;
+  var all = document.querySelectorAll(".ds-message");
+  return !all.length || all[all.length - 1] !== msgEl;
 }
 
 function isProcessed(block, id) {
@@ -71,7 +104,7 @@ function ensureStyles() {
     "  content: \"\";" +
     "  display: inline-block;" +
     "  width: 10px; height: 10px;" +
-    "  border: 2px solid #4f46e5;" +
+    "  border: 2px solid var(--accent,#D97757);" +
     "  border-top-color: transparent;" +
     "  border-radius: 50%;" +
     "  margin-right: 6px;" +
@@ -81,13 +114,6 @@ function ensureStyles() {
     ".adshield-run-btn:disabled { cursor: wait; }";
   document.head.appendChild(style);
 }
-
-// ============ 用户手动输入监听（重置自动执行链）============
-document.addEventListener("input", function(e) {
-  if (e.target && e.target.tagName === "TEXTAREA" && !window.__adshieldSelfSend) {
-    autoChain = 0;
-  }
-}, true);
 
 // ============ 初始化 ============
 if (document.readyState === "loading") {
@@ -100,6 +126,7 @@ function init() {
   injectGLMUI();
   console.log("[DeepSeek Desktop] preload 注入成功 (自动模式)");
   ensureStyles();
+  scheduleSidebarTag();
 
   // ★ 网络 hook 触发已禁用（DeepSeek 分片 XHR 无法可靠累积）
   //   保留 probe.js 继续打印日志（研究用），但不用它触发执行
@@ -109,9 +136,52 @@ function init() {
   // 旧实现是「MutationObserver 打个标记 + 每 2 秒全量扫 document.body」，
   // 而全量扫描会对每个 <pre> 向上遍历 4~5 层父节点并读 innerText（触发强制重排）。
   // DeepSeek 长对话里有几百个 <pre>，等于每 2 秒把整页重排一次。
+  var lastHref = location.href;
+  historyGuardUntil = Date.now() + HISTORY_GUARD_MS;
+
+  // 用户发送消息（按 Enter 或点输入区按钮）才算「本次请求」。
+  // 自动执行只服务本次请求的回复；没有这个信号时，页面上的块一律按历史处理。
+  document.addEventListener("keydown", function(e) {
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+    var t = e.target;
+    if (t && t.tagName === "TEXTAREA" && (t.value || "").trim()) {
+      lastUserActionAt = Date.now();
+    }
+  }, true);
+  document.addEventListener("click", function(e) {
+    var ta = document.querySelector("textarea");
+    if (!ta || !(ta.value || "").trim()) return;
+    var node = e.target;
+    for (var up = 0; node && up < 8; up++, node = node.parentElement) {
+      if (node === ta) break;
+      var role = node.getAttribute && node.getAttribute("role");
+      if (node.tagName === "BUTTON" || role === "button") {
+        var rb = node.getBoundingClientRect();
+        var rt = ta.getBoundingClientRect();
+        if (Math.abs((rb.top + rb.bottom) / 2 - (rt.top + rt.bottom) / 2) < 160) {
+          lastUserActionAt = Date.now();
+        }
+        break;
+      }
+    }
+  }, true);
   var observer = new MutationObserver(function(mutations) {
     for (var i = 0; i < mutations.length; i++) collectPresFromMutation(mutations[i]);
     scheduleScan();
+    // 主题需要的两个几何钩子：侧栏容器和免责行都是 React 后渲染的，
+    // 只靠开屏时刻表会错过（实测免责行在进入会话后才出现）。
+    // 挂在已有 observer 上、3 秒最多走一次，找到后不再走。
+    // 切会话走的是客户端路由：旧节点被换新节点，data-ds-* 属性跟着丢，而 3 秒节流
+    // 对这个瞬间太慢（实测那行提示会闪 2~4 秒）。所以 URL 一变就把节流清零补跑一次。
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      regionState.last = 0;
+      // 切会话：紧接着渲染出来的是历史消息，重新开一段静默窗，
+      // 并把「本次请求」标记清掉——上一个会话的操作不能带进新会话。
+      historyGuardUntil = Date.now() + HISTORY_GUARD_MS;
+      lastUserActionAt = 0;
+    }
+    regionPass();
   });
   // characterData 必须监听：流式输出时 DeepSeek 常常只改已有 <pre> 里的文本节点，
   // 不新增元素，只听 childList 会漏掉正在增长中的代码块
@@ -119,6 +189,155 @@ function init() {
 
   // 首屏兜底：注入时页面上可能已经渲染好了历史代码块
   setTimeout(function() { scan(document.body); }, 2000);
+}
+
+// ===== 侧栏区域标记 =====
+// DeepSeek 的布局容器全是构建期哈希类名（cb86951c、_27c9245 这种），每次发版换一套，
+// 样式表抓不住；能长期成立的只有几何信号。这里顺着 #root 往下走，找到「贴左边、
+// 又高、宽度不超过四成视口」的那块真正上色的容器，打一个 data-ds-region="side"，
+// 主题按这个属性给侧栏上暖灰。挂载完成后结构基本不再变，所以只在有限几个时刻各试一次。
+function tagSidebarRegion() {
+  try {
+    // 旧标记所在的节点可能已被 React 换掉、或收起成了 0 宽：这时要清掉标记重判，
+    // 否则 querySelector 仍会命中那个不可见的旧节点，新侧栏永远等不到标记。
+    var tagged = document.querySelector('[data-ds-region="side"]');
+    if (tagged) {
+      if (tagged.getBoundingClientRect().width > 0) return true;
+      tagged.removeAttribute("data-ds-region");
+    }
+    var vw = window.innerWidth || 1280;
+    var vh = window.innerHeight || 800;
+    var cands = [];
+    // 原来直接 querySelectorAll("div") 再逐个量矩形：侧栏收起时没有候选，
+    // 每 3 秒要把整页上千个 div 全量 layout 一遍。判定条件本来就要求候选
+    // 自己包含 .ds-scroll-area / .ds-button，所以从这两个钩子向上爬即可，
+    // 候选集缩到几十个，命中结果完全等价。
+    var seeds = document.querySelectorAll(".ds-scroll-area, .ds-button");
+    var seen = new Set();
+    for (var s = 0; s < seeds.length && cands.length <= 12; s++) {
+      var up = seeds[s].parentElement;
+      for (var d = 0; d < 12 && up; d++, up = up.parentElement) {
+        if (up.tagName !== "DIV" || seen.has(up)) continue;
+        seen.add(up);
+        var r = up.getBoundingClientRect();
+        if (r.left > 8) continue;                                  // 必须贴左边
+        if (r.width > vw * 0.42) continue;
+        // 收起态的图标栏只有 ~64px。旧的下限 170 把整条侧栏挡在外面，
+        // 那一栏就露出了宿主底色（实测与画布同为 #FAF9F5，等于没上主题）。
+        // 窄栏另外要求几乎撑满全高，避免把正文里的窄列误判成侧栏。
+        var narrow = r.width >= 48 && r.width < 170;
+        if (!narrow && r.width < 170) continue;
+        if (r.height < (narrow ? vh * 0.9 : vh * 0.55)) continue;
+        if (up.children.length < 2) continue;                      // 侧栏至少有 logo 行 + 列表
+        cands.push(up);
+        if (cands.length > 12) break;
+      }
+    }
+    if (!cands.length) return false;
+    // 展开态与收起态短暂共存时，优先用宽的那批，保证展开时的判定与原来完全一致；
+    // 只有当宽候选一个都没有，才退回到窄栏。
+    var wide = cands.filter(function (c) { return c.getBoundingClientRect().width >= 170; });
+    if (wide.length) cands = wide;
+    // 候选里要挑【自己画底色】的那一层：外层包装往往是透明的，标在它身上
+    // 会被内层的白盖掉，等于没改。取画了不透明背景、且最靠内（宽度最小）的那个。
+    var best = null, bestW = 1e9;
+    for (var k = 0; k < cands.length; k++) {
+      var bg = getComputedStyle(cands[k]).backgroundColor;
+      var m = bg.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)$/);
+      if (!m) continue;
+      if (m[4] !== undefined && parseFloat(m[4]) < 0.5) continue;   // 透明/近透明
+      if (cands[k].getBoundingClientRect().width < bestW) { best = cands[k]; bestW = cands[k].getBoundingClientRect().width; }
+    }
+    if (!best) return false;
+    best.setAttribute("data-ds-region", "side");
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 两个钩子都要等 React 渲染，所以既跑开屏时刻表，也跑在 mutation 回调里；
+// 各自成功一次就不再重复，整页最多 3 秒一次，成本可以忽略。
+var regionState = { side: false, hint: false, last: 0 };
+function regionPass() {
+  var now = Date.now();
+  if (now - regionState.last < 3000) return;
+  regionState.last = now;
+  // 不能"成功一次就停"：展开/收起会换掉侧栏节点，旧标记随旧节点消失，
+  // 而缓存 true 会让标记永远补不回来 —— 表现就是收起后那一条图标栏没了暖灰。
+  // tagSidebarRegion 开头会先看现有标记，命中就直接返回，重复成本只有一次查询。
+  regionState.side = tagSidebarRegion();
+  // 不设「做过就停」：这行是 React 渲染的，切会话/重渲染会换成新节点，
+  // 属性跟着丢；一次性的话第一遍打完标就再也管不到后面那些节点了。
+  hideComposerHint();
+  tagBubbles();          // 消息会持续增加，这条不设「做过就停」
+}
+
+function scheduleSidebarTag() {
+  var tries = [400, 1200, 2500, 5000, 9000, 15000];
+  for (var i = 0; i < tries.length; i++) setTimeout(regionPass, tries[i]);
+}
+
+// 输入区下方那行「内容由 AI 生成，请仔细甄别」——用户要求去掉。
+// 它的类名是构建期哈希，只有文案是稳的，所以按文本匹配而不是 CSS 选择器。
+// 搜索范围刻意限定在输入区往上几层：正文回复里也可能出现同样的句子，
+// 那种情况必须留着，不能被当成页面装饰抹掉。
+function hideComposerHint() {
+  try {
+    // 上一次标过的节点还挂着就说明已经隐藏了，不必再扫一遍。
+    // React 重渲染换掉它时旧节点会脱离文档，这里就会重新扫。
+    var marked = document.querySelector('[data-ds-hidden="1"]');
+    if (marked && marked.isConnected) return true;
+    var comp = document.querySelector("div:has(> textarea)");
+    if (!comp) return false;
+    // 实测免责行离输入框容器有 10 层，只往上找 3 层根本覆盖不到
+    var scope = comp;
+    for (var up = 0; up < 12 && scope.parentElement; up++) scope = scope.parentElement;
+    var nodes = scope.querySelectorAll("*");
+    var hit = false;
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.children.length) continue;             // 只标叶子，避免把整块内容吞掉
+      var t = (el.textContent || "").replace(/\s+/g, "");
+      if (t.indexOf("内容由AI生成") < 0) continue;   // 用「包含」而不是「开头」：实测这行文本里有零宽字符，前缀匹配会漏
+      var r = el.getBoundingClientRect();
+      if (r.height > 60 || r.width > window.innerWidth * 0.8) continue;   // 页面提示条是小字一行，正文里复述这句话的长块不算
+      el.setAttribute("data-ds-hidden", "1");
+      hit = true;
+    }
+    return hit;
+  } catch (e) { return false; }
+}
+
+// 用户消息气泡。实测 .ds-message 同时挂在用户和 AI 两种消息上，气泡自己只有哈希
+// 类名（fbb737a4），CSS 无从分辨「哪块有底色」。用「.ds-message 的直接子元素 +
+// 自己不透明底色 + 比消息行窄」这三条事实认它，命中后打个稳定属性给样式表用。
+// AI 消息的直接子元素是透明的，所以不会被误标。
+var bubbleDone = new WeakSet();
+// AI 消息的直接子元素永远是透明底，这是结构事实而不是临时状态。
+// 不记住这些负结果的话，每 3 秒都要对历史里每条 AI 消息重新 getComputedStyle
+// + 量矩形，长对话下是白烧的 O(消息数)。
+var bubbleMiss = new WeakSet();
+function tagBubbles() {
+  try {
+    var msgs = document.querySelectorAll(".ds-message");
+    for (var i = 0; i < msgs.length; i++) {
+      var kids = msgs[i].children;
+      for (var j = 0; j < kids.length; j++) {
+        var el = kids[j];
+        if (bubbleDone.has(el) || bubbleMiss.has(el)) continue;
+        var m = getComputedStyle(el).backgroundColor.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)$/);
+        if (!m) continue;
+        if (m[4] !== undefined && parseFloat(m[4]) < 0.5) { bubbleMiss.add(el); continue; }    // 透明 = 不是气泡
+        var r = el.getBoundingClientRect();
+        if (r.width < 60 || r.height < 24) continue;
+        if (r.width > msgs[i].getBoundingClientRect().width * 0.95) continue;  // 满宽 = 整行，不是气泡
+        if (!(el.textContent || "").trim()) continue;
+        bubbleDone.add(el);
+        el.setAttribute("data-ds-region", "bubble");
+      }
+    }
+  } catch (e) {}
 }
 
 // GLM 面板和它的设置弹层是注入层自己的 DOM，不是 AI 回复里的代码块。
@@ -366,7 +585,22 @@ function scanPre(pre) {
     pre.setAttribute("data-adshield-id", "pre-" + window.__adshield_seq);
   }
   var id = pre.getAttribute("data-adshield-id");
-  if (isProcessed(pre, id)) return;
+  // 内容哈希跨渲染去重：虚拟列表滚动重挂载、编辑消息都会换掉 DOM 节点，
+  // 只按元素记账会让同一段旧代码被重新执行。哈希带上会话路径，不同会话互不影响。
+  var codeKey = codeKeyFor(codeText);
+  if (isProcessed(pre, id) || isProcessed(null, codeKey)) return;
+
+  // 历史消息：打开应用或切回旧会话时，DOM 里的代码块是当时的 AI 回复，
+  // 不是这次的新请求。自动重放的后果是弹危险确认甚至真的执行旧命令，
+  // 所以只记账并在块下放一个「手动执行」，让用户自己决定。
+  if (isHistoricalBlock(pre)) {
+    markProcessed(pre, id);
+    markProcessed(null, codeKey);
+    injectButton(pre, codeText, id, "历史消息，未自动执行");
+    return;
+  }
+
+  markProcessed(null, codeKey);
   scheduleExecute(pre, codeText, id);
 }
 
@@ -411,15 +645,6 @@ async function autoExecute(block, code, id, force) {
       }
       msgEl.setAttribute("data-adshield-done", "1");
     }
-  }
-
-  // 链上限只在自动执行时消耗，用户手点"手动执行"不计入配额
-  if (!force) {
-    if (autoChain >= MAX_CHAIN) {
-      injectButton(block, code, id, "已达自动执行上限（" + MAX_CHAIN + "），请手动点击");
-      return;
-    }
-    autoChain++;
   }
 
   // 检查危险等级
@@ -506,7 +731,7 @@ function injectButton(block, code, id, statusText) {
 
     var status = document.createElement("span");
     status.className = "adshield-run-status";
-    status.style.cssText = "color:#6b7280;font-size:12px;line-height:1;white-space:nowrap;";
+    status.style.cssText = "color:var(--text-tertiary,#83827D);font-size:12px;line-height:1;white-space:nowrap;";
     status.textContent = statusText || "";
     if (/执行中/.test(statusText || "")) status.classList.add("loading");
 
@@ -514,7 +739,7 @@ function injectButton(block, code, id, statusText) {
     var btn = document.createElement("button");
     btn.className = "adshield-run-btn";
     btn.textContent = "手动执行";
-    btn.style.cssText = "padding:2px 8px;background:transparent;color:#4f46e5;border:1px solid #4f46e5;border-radius:12px;cursor:pointer;font-size:11px;line-height:1.4;";
+    btn.style.cssText = "padding:2px 8px;background:transparent;color:var(--accent-text,#B0491F);border:1px solid var(--accent,#D97757);border-radius:10px;cursor:pointer;font-size:11px;line-height:1.4;";
     btn.onclick = async function() {
       btn.disabled = true;
       btn.textContent = "执行中";
@@ -552,14 +777,14 @@ function injectButton(block, code, id, statusText) {
 
   var status2 = document.createElement("span");
   status2.className = "adshield-run-status";
-  status2.style.cssText = "color:#6b7280;font-size:12px;";
+  status2.style.cssText = "color:var(--text-tertiary,#83827D);font-size:12px;";
   status2.textContent = statusText || "";
   if (/执行中/.test(statusText || "")) status2.classList.add("loading");
 
   var btn2 = document.createElement("button");
   btn2.className = "adshield-run-btn";
   btn2.textContent = "▶ 手动执行";
-  btn2.style.cssText = "padding:4px 10px;background:#4f46e5;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;";
+  btn2.style.cssText = "padding:4px 10px;background:var(--accent,#D97757);color:var(--text-inverse,#FAF9F5);border:none;border-radius:10px;cursor:pointer;font-size:11px;";
   btn2.onclick = async function() {
     btn2.disabled = true;
     btn2.textContent = "执行中";
@@ -701,8 +926,6 @@ async function sendToInput(text) {
     return false;
   }
 
-  window.__adshieldSelfSend = true;
-
   try {
     // 填入 textarea（React 兼容）
     var setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
@@ -729,8 +952,6 @@ async function sendToInput(text) {
   } catch (e) {
     console.error("[DeepSeek Desktop] 发送失败:", e);
     return false;
-  } finally {
-    setTimeout(function() { window.__adshieldSelfSend = false; }, 1000);
   }
 }
 
@@ -848,65 +1069,65 @@ function renderMarkdown(text) {
 
 var GLM_CSS = [
 
-  "#adshield-ai-sidebar{position:fixed;top:0;right:-440px;width:420px;height:100vh;background:rgba(252,253,255,0.95);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);box-shadow:-8px 0 32px rgba(15,23,42,0.08);border-left:1px solid rgba(226,232,240,0.6);z-index:999999;transition:right .4s cubic-bezier(.16,1,.3,1);display:flex;flex-direction:column;font-family:-apple-system,Segoe UI,Microsoft YaHei,sans-serif;color:#0f172a}",
-  "#adshield-ai-sidebar .glm-header{padding:16px 20px;background:rgba(255,255,255,0.7);border-bottom:1px solid rgba(226,232,240,0.8);display:flex;justify-content:space-between;align-items:center}",
-  "#adshield-ai-sidebar .glm-title{display:flex;align-items:center;gap:10px;font-weight:600;font-size:15px}",
-  "#adshield-ai-sidebar .glm-title-icon{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,#4f46e5,#7c3aed);display:flex;align-items:center;justify-content:center;color:#fff}",
+  "#adshield-ai-sidebar{position:fixed;top:0;right:-440px;width:420px;height:100vh;background:var(--bg-surface,#FDFCFA);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);box-shadow:var(--shadow-lg,0 12px 40px rgba(20,20,19,.10));border-left:1px solid var(--border-default,#E3DACC);z-index:999999;transition:right .4s cubic-bezier(.16,1,.3,1);display:flex;flex-direction:column;font-family:var(--font-ui,'Inter',-apple-system,'Segoe UI','Microsoft YaHei',sans-serif);color:var(--text-primary,#141413)}",
+  "#adshield-ai-sidebar .glm-header{padding:16px 20px;background:var(--bg-surface,#FDFCFA);border-bottom:1px solid var(--border-default,#E3DACC);display:flex;justify-content:space-between;align-items:center}",
+  "#adshield-ai-sidebar .glm-title{display:flex;align-items:center;gap:10px;font-weight:600;font-size:15px;font-family:var(--font-serif,'Source Serif 4',Georgia,'Songti SC',serif)}",
+  "#adshield-ai-sidebar .glm-title-icon{width:26px;height:26px;border-radius:10px;background:linear-gradient(135deg,var(--accent,#D97757),var(--accent-hover,#C15F3C));display:flex;align-items:center;justify-content:center;color:var(--text-inverse,#FAF9F5)}",
   "#adshield-ai-sidebar .glm-header-actions{display:flex;gap:4px}",
-  "#adshield-ai-sidebar .glm-btn-icon{background:transparent;border:none;cursor:pointer;color:#64748b;width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;transition:all .15s;font-size:18px;padding:0}",
-  "#adshield-ai-sidebar .glm-btn-icon:hover{background:rgba(15,23,42,0.06);color:#0f172a}",
+  "#adshield-ai-sidebar .glm-btn-icon{background:transparent;border:none;cursor:pointer;color:var(--text-secondary,#5E5D59);width:30px;height:30px;border-radius:10px;display:flex;align-items:center;justify-content:center;transition:all .15s;font-size:18px;padding:0}",
+  "#adshield-ai-sidebar .glm-btn-icon:hover{background:var(--bg-subtle,#F0EEE6);color:var(--text-primary,#141413)}",
   "#adshield-ai-sidebar .glm-chat-area{flex:1;padding:20px;overflow-y:auto;display:flex;flex-direction:column;gap:20px}",
   "#adshield-ai-sidebar .glm-chat-area::-webkit-scrollbar{width:6px}",
-  "#adshield-ai-sidebar .glm-chat-area::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:10px}",
-  "#adshield-ai-sidebar .glm-msg-user{align-self:flex-end;background:#0f172a;color:#f8fafc;padding:10px 16px;border-radius:16px 16px 4px 16px;font-size:14px;max-width:85%;line-height:1.6;word-break:break-word;box-shadow:0 4px 12px rgba(15,23,42,0.12)}",
-  "#adshield-ai-sidebar .glm-msg-bot{align-self:flex-start;background:#f1f5f9;border:1px solid #e2e8f0;color:#334155;padding:12px 16px;border-radius:16px 16px 16px 4px;font-size:14px;max-width:92%;line-height:1.7;word-break:break-word;white-space:pre-wrap}",
-  "#adshield-ai-sidebar .glm-msg-bot code{background:rgba(15,23,42,0.06);padding:2px 6px;border-radius:4px;font-family:SF Mono,Monaco,Consolas,monospace;font-size:.9em;color:#be185d}",
-  "#adshield-ai-sidebar .glm-msg-bot pre{background:#1e293b;color:#f1f5f9;padding:14px;border-radius:10px;overflow-x:auto;margin:8px 0;font-family:SF Mono,Monaco,Consolas,monospace;font-size:13px;line-height:1.5}",
+  "#adshield-ai-sidebar .glm-chat-area::-webkit-scrollbar-thumb{background:var(--border-strong,#D1CFC5);border-radius:10px}",
+  "#adshield-ai-sidebar .glm-msg-user{align-self:flex-end;background:var(--bg-raised,#E8E6DE);color:var(--text-primary,#141413);padding:10px 16px;border-radius:16px 16px 10px 16px;font-size:14px;max-width:85%;line-height:1.6;word-break:break-word;box-shadow:var(--shadow-md,0 4px 16px rgba(20,20,19,.06))}",
+  "#adshield-ai-sidebar .glm-msg-bot{align-self:flex-start;background:var(--bg-subtle,#F0EEE6);border:1px solid var(--border-default,#E3DACC);color:var(--text-primary,#141413);padding:12px 16px;border-radius:16px 16px 16px 10px;font-size:14px;max-width:92%;line-height:1.7;word-break:break-word;white-space:pre-wrap}",
+  "#adshield-ai-sidebar .glm-msg-bot code{background:var(--bg-raised,#E8E6DE);padding:2px 6px;border-radius:6px;font-family:SF Mono,Monaco,Consolas,monospace;font-size:.9em;color:var(--accent-text,#B0491F)}",
+  "#adshield-ai-sidebar .glm-msg-bot pre{background:var(--bg-inverse,#141413);color:var(--text-inverse,#FAF9F5);padding:14px;border-radius:10px;overflow-x:auto;margin:8px 0;font-family:SF Mono,Monaco,Consolas,monospace;font-size:13px;line-height:1.5}",
   "#adshield-ai-sidebar .glm-msg-bot pre code{background:transparent;color:inherit;padding:0}",
-  "#adshield-ai-sidebar .glm-typing::after{content:'▋';animation:codex-blink 1s step-end infinite;color:#4f46e5;margin-left:2px}",
+  "#adshield-ai-sidebar .glm-typing::after{content:'▋';animation:codex-blink 1s step-end infinite;color:var(--accent,#D97757);margin-left:2px}",
   "#adshield-ai-sidebar .glm-input-area{padding:16px 20px 20px}",
-  "#adshield-ai-sidebar .glm-input-box{display:flex;align-items:flex-end;background:#fff;border:1.5px solid #e2e8f0;border-radius:14px;padding:10px 12px 10px 16px;box-shadow:0 4px 24px rgba(15,23,42,0.04);transition:all .2s}",
-  "#adshield-ai-sidebar .glm-input-box:focus-within{border-color:#4f46e5;box-shadow:0 4px 24px rgba(79,70,229,0.12),0 0 0 3px rgba(79,70,229,0.08)}",
-  "#adshield-ai-sidebar .glm-textarea{width:100%;border:none;resize:none;outline:none;background:transparent;padding:4px 0;margin:0;min-height:24px;height:24px;max-height:120px;font-size:14px;color:#0f172a;line-height:1.5;font-family:inherit}",
-  "#adshield-ai-sidebar .glm-textarea::placeholder{color:#94a3b8}",
-  "#adshield-ai-sidebar .glm-send-btn{width:32px;height:32px;border-radius:10px;background:#0f172a;color:#fff;display:flex;justify-content:center;align-items:center;flex-shrink:0;margin-left:10px;cursor:pointer;transition:all .15s;border:none;padding:0}",
-  "#adshield-ai-sidebar .glm-send-btn:hover:not(:disabled){background:#4f46e5}",
-  "#adshield-ai-sidebar .glm-send-btn:disabled{background:#e2e8f0;color:#94a3b8;cursor:not-allowed}",
-  "#adshield-ai-sidebar .glm-empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#64748b;text-align:center;padding:0 20px}",
-  "#adshield-ai-sidebar .glm-empty-icon{width:64px;height:64px;border-radius:20px;background:linear-gradient(135deg,#4f46e5,#7c3aed);display:flex;align-items:center;justify-content:center;color:#fff;margin-bottom:20px;box-shadow:0 8px 24px rgba(79,70,229,0.25)}",
-  "#adshield-ai-sidebar .glm-empty-title{font-size:16px;font-weight:600;color:#0f172a;margin-bottom:8px}",
-  "#adshield-ai-sidebar .glm-empty-desc{font-size:13px;line-height:1.6;color:#64748b}",
+  "#adshield-ai-sidebar .glm-input-box{display:flex;align-items:flex-end;background:var(--bg-canvas,#FAF9F5);border:1px solid var(--border-strong,#D1CFC5);border-radius:14px;padding:10px 12px 10px 16px;box-shadow:var(--shadow-md,0 4px 16px rgba(20,20,19,.06));transition:all .2s}",
+  "#adshield-ai-sidebar .glm-input-box:focus-within{border-color:var(--accent,#D97757);box-shadow:0 0 0 3px var(--accent-soft,#F5E5DE)}",
+  "#adshield-ai-sidebar .glm-textarea{width:100%;border:none;resize:none;outline:none;background:transparent;padding:4px 0;margin:0;min-height:24px;height:24px;max-height:120px;font-size:14px;color:var(--text-primary,#141413);line-height:1.5;font-family:inherit}",
+  "#adshield-ai-sidebar .glm-textarea::placeholder{color:var(--text-tertiary,#83827D)}",
+  "#adshield-ai-sidebar .glm-send-btn{width:32px;height:32px;border-radius:10px;background:var(--accent,#D97757);color:var(--text-inverse,#FAF9F5);display:flex;justify-content:center;align-items:center;flex-shrink:0;margin-left:10px;cursor:pointer;transition:all .15s;border:none;padding:0}",
+  "#adshield-ai-sidebar .glm-send-btn:hover:not(:disabled){background:var(--accent-hover,#C15F3C)}",
+  "#adshield-ai-sidebar .glm-send-btn:disabled{background:var(--bg-raised,#E8E6DE);color:var(--text-disabled,#B0AEA5);cursor:not-allowed}",
+  "#adshield-ai-sidebar .glm-empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--text-secondary,#5E5D59);text-align:center;padding:0 20px}",
+  "#adshield-ai-sidebar .glm-empty-icon{width:64px;height:64px;border-radius:20px;background:linear-gradient(135deg,var(--accent,#D97757),var(--accent-hover,#C15F3C));display:flex;align-items:center;justify-content:center;color:var(--text-inverse,#FAF9F5);margin-bottom:20px;box-shadow:var(--shadow-md,0 4px 16px rgba(20,20,19,.06))}",
+  "#adshield-ai-sidebar .glm-empty-title{font-size:16px;font-weight:600;color:var(--text-primary,#141413);margin-bottom:8px;font-family:var(--font-serif,'Source Serif 4',Georgia,'Songti SC',serif)}",
+  "#adshield-ai-sidebar .glm-empty-desc{font-size:13px;line-height:1.6;color:var(--text-tertiary,#83827D)}",
   "@keyframes codex-blink{0%,100%{opacity:1}50%{opacity:0}}",
-  "#adshield-glm-settings{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,23,42,0.4);backdrop-filter:blur(4px);z-index:9999999;display:none;align-items:center;justify-content:center}",
+  "#adshield-glm-settings{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(20,20,19,0.45);backdrop-filter:blur(4px);z-index:9999999;display:none;align-items:center;justify-content:center;font-family:var(--font-ui,'Inter',-apple-system,'Segoe UI','Microsoft YaHei',sans-serif)}",
   "#adshield-glm-settings.active{display:flex}",
-  "#adshield-glm-settings .settings-card{width:440px;max-width:90vw;max-height:85vh;background:#faf9f5;border-radius:16px;box-shadow:0 24px 64px rgba(15,23,42,0.25);display:flex;flex-direction:column;overflow:hidden}",
-  "#adshield-glm-settings .settings-header{padding:18px 22px;border-bottom:1px solid #e8e6dc;display:flex;justify-content:space-between;align-items:center}",
-  "#adshield-glm-settings .settings-title{font-size:16px;font-weight:600;color:#141413}",
-  "#adshield-glm-settings .settings-close{width:28px;height:28px;border-radius:8px;border:none;background:transparent;cursor:pointer;color:#b0aea5;display:flex;align-items:center;justify-content:center;transition:all .15s;padding:0;font-size:20px;line-height:1}",
-  "#adshield-glm-settings .settings-close:hover{background:#e8e6dc;color:#141413}",
+  "#adshield-glm-settings .settings-card{width:440px;max-width:90vw;max-height:85vh;background:var(--bg-surface,#FDFCFA);border:1px solid var(--border-default,#E3DACC);border-radius:16px;box-shadow:var(--shadow-lg,0 12px 40px rgba(20,20,19,.10));display:flex;flex-direction:column;overflow:hidden}",
+  "#adshield-glm-settings .settings-header{padding:18px 22px;border-bottom:1px solid var(--border-default,#E3DACC);display:flex;justify-content:space-between;align-items:center}",
+  "#adshield-glm-settings .settings-title{font-size:16px;font-weight:600;color:var(--text-primary,#141413);font-family:var(--font-serif,'Source Serif 4',Georgia,'Songti SC',serif)}",
+  "#adshield-glm-settings .settings-close{width:28px;height:28px;border-radius:10px;border:none;background:transparent;cursor:pointer;color:var(--text-tertiary,#83827D);display:flex;align-items:center;justify-content:center;transition:all .15s;padding:0;font-size:20px;line-height:1}",
+  "#adshield-glm-settings .settings-close:hover{background:var(--bg-subtle,#F0EEE6);color:var(--text-primary,#141413)}",
   "#adshield-glm-settings .settings-body{padding:22px;overflow-y:auto;flex:1}",
   "#adshield-glm-settings .settings-field{margin-bottom:18px}",
   "#adshield-glm-settings .settings-field:last-child{margin-bottom:0}",
-  "#adshield-glm-settings .settings-label{display:block;font-size:12px;font-weight:600;color:#141413;margin-bottom:6px}",
-  "#adshield-glm-settings .settings-hint{font-size:11px;color:#b0aea5;margin-top:4px;line-height:1.5}",
-  "#adshield-glm-settings .settings-warn{color:#b45309;background:#fef3c7;border:1px solid #fde68a;border-radius:6px;padding:6px 8px;margin-top:6px}",
-  "#adshield-glm-settings .settings-input,#adshield-glm-settings .settings-select{width:100%;padding:9px 12px;border-radius:8px;border:1px solid #e8e6dc;background:#fff;font-size:13px;color:#141413;font-family:inherit;outline:none;box-sizing:border-box;transition:border-color .15s,box-shadow .15s}",
-  "#adshield-glm-settings .settings-input:focus,#adshield-glm-settings .settings-select:focus{border-color:#d97757;box-shadow:0 0 0 3px rgba(217,119,87,0.12)}",
+  "#adshield-glm-settings .settings-label{display:block;font-size:12px;font-weight:600;color:var(--text-primary,#141413);margin-bottom:6px}",
+  "#adshield-glm-settings .settings-hint{font-size:11px;color:var(--text-tertiary,#83827D);margin-top:4px;line-height:1.5}",
+  "#adshield-glm-settings .settings-warn{color:var(--danger,#B33D3D);background:var(--accent-soft,#F5E5DE);border:1px solid var(--border-default,#E3DACC);border-radius:10px;padding:6px 8px;margin-top:6px}",
+  "#adshield-glm-settings .settings-input,#adshield-glm-settings .settings-select{width:100%;padding:9px 12px;border-radius:10px;border:1px solid var(--border-strong,#D1CFC5);background:var(--bg-canvas,#FAF9F5);font-size:13px;color:var(--text-primary,#141413);font-family:inherit;outline:none;box-sizing:border-box;transition:border-color .15s,box-shadow .15s}",
+  "#adshield-glm-settings .settings-input:focus,#adshield-glm-settings .settings-select:focus{border-color:var(--accent,#D97757);box-shadow:0 0 0 3px var(--accent-soft,#F5E5DE)}",
   "#adshield-glm-settings .settings-password-wrap{position:relative}",
   "#adshield-glm-settings .settings-password-wrap .settings-input{padding-right:60px}",
-  "#adshield-glm-settings .settings-toggle-pwd{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:transparent;border:none;cursor:pointer;font-size:11px;color:#d97757;padding:4px 8px;border-radius:4px}",
-  "#adshield-glm-settings .settings-toggle-pwd:hover{background:rgba(217,119,87,0.1)}",
+  "#adshield-glm-settings .settings-toggle-pwd{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:transparent;border:none;cursor:pointer;font-size:11px;color:var(--accent-text,#B0491F);padding:4px 8px;border-radius:8px}",
+  "#adshield-glm-settings .settings-toggle-pwd:hover{background:var(--accent-soft,#F5E5DE)}",
   "#adshield-glm-settings .settings-range-wrap{display:flex;align-items:center;gap:12px}",
-  "#adshield-glm-settings .settings-range{flex:1;height:4px;border-radius:2px;background:#e8e6dc;outline:none;-webkit-appearance:none}",
-  "#adshield-glm-settings .settings-range::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#d97757;cursor:pointer;box-shadow:0 2px 6px rgba(217,119,87,0.3)}",
-  "#adshield-glm-settings .settings-range-value{min-width:36px;text-align:center;font-size:12px;font-weight:600;color:#d97757;font-variant-numeric:tabular-nums}",
-  "#adshield-glm-settings .settings-footer{padding:16px 22px;border-top:1px solid #e8e6dc;display:flex;justify-content:flex-end;gap:8px}",
-  "#adshield-glm-settings .settings-btn{padding:8px 18px;border-radius:8px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit}",
-  "#adshield-glm-settings .settings-btn-cancel{background:transparent;color:#b0aea5}",
-  "#adshield-glm-settings .settings-btn-cancel:hover{background:#e8e6dc;color:#141413}",
-  "#adshield-glm-settings .settings-btn-save{background:#d97757;color:#fff;box-shadow:0 2px 8px rgba(217,119,87,0.25)}",
-  "#adshield-glm-settings .settings-btn-save:hover{background:#c96a47;transform:translateY(-1px)}",
-  "#adshield-glm-settings .settings-btn-save:disabled{background:#e8e6dc;color:#b0aea5;cursor:not-allowed;transform:none;box-shadow:none}"
+  "#adshield-glm-settings .settings-range{flex:1;height:4px;border-radius:2px;background:var(--bg-raised,#E8E6DE);outline:none;-webkit-appearance:none}",
+  "#adshield-glm-settings .settings-range::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent,#D97757);cursor:pointer;box-shadow:0 0 0 3px var(--accent-soft,#F5E5DE)}",
+  "#adshield-glm-settings .settings-range-value{min-width:36px;text-align:center;font-size:12px;font-weight:600;color:var(--accent-text,#B0491F);font-variant-numeric:tabular-nums}",
+  "#adshield-glm-settings .settings-footer{padding:16px 22px;border-top:1px solid var(--border-default,#E3DACC);display:flex;justify-content:flex-end;gap:8px}",
+  "#adshield-glm-settings .settings-btn{padding:8px 18px;border-radius:10px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit}",
+  "#adshield-glm-settings .settings-btn-cancel{background:transparent;color:var(--text-secondary,#5E5D59)}",
+  "#adshield-glm-settings .settings-btn-cancel:hover{background:var(--bg-subtle,#F0EEE6);color:var(--text-primary,#141413)}",
+  "#adshield-glm-settings .settings-btn-save{background:var(--accent,#D97757);color:var(--text-inverse,#FAF9F5);box-shadow:var(--shadow-md,0 4px 16px rgba(20,20,19,.06))}",
+  "#adshield-glm-settings .settings-btn-save:hover{background:var(--accent-hover,#C15F3C);transform:translateY(-1px)}",
+  "#adshield-glm-settings .settings-btn-save:disabled{background:var(--bg-raised,#E8E6DE);color:var(--text-disabled,#B0AEA5);cursor:not-allowed;transform:none;box-shadow:none}"
 ].join("\n");
 
 var GLM_PANEL_HTML = [
@@ -1037,16 +1258,16 @@ function injectGLMUI() {
       "width:" + FLOAT_SIZE + "px;" +
       "height:" + FLOAT_SIZE + "px;" +
       "border-radius:50%;" +
-      "background:linear-gradient(135deg,#8B5CF6,#6D28D9);" +
-      "display:flex;align-items:center;justify-content:center;color:#fff;" +
+      "background:linear-gradient(135deg,var(--accent,#D97757),var(--accent-hover,#C15F3C));" +
+      "display:flex;align-items:center;justify-content:center;color:var(--text-inverse,#FAF9F5);" +
       "cursor:grab;" +
-      "box-shadow:0 8px 24px rgba(109,40,217,0.35);" +
+      "box-shadow:var(--shadow-lg,0 12px 40px rgba(20,20,19,.10));" +
       "z-index:99999;" +
       "transition:transform .2s,box-shadow .2s,opacity .2s;" +
       "user-select:none;touch-action:none;";
 
     // ZAI 沙漏图标
-    openBtn.innerHTML = '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 6 L15 6 L12 12 L15 18 L9 18 L12 12 Z" fill="white"/></svg>';
+    openBtn.innerHTML = '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 6 L15 6 L12 12 L15 18 L9 18 L12 12 Z" fill="#FAF9F5"/></svg>';
 
     // 拖动逻辑
     var dragState = { active: false, moved: false, sx: 0, sy: 0, sl: 0, st: 0, maxL: 0, maxT: 0 };
@@ -1279,7 +1500,7 @@ function injectGLMUI() {
       currentBotMsg.classList.remove("glm-typing");
       var partial = glmRawText;
       currentBotMsg.innerHTML = (partial ? renderMarkdown(partial) + "<br>" : "") +
-        '<span style="color:#ef4444;">❌ 错误: ' + escapeHtml(payload.error) + '</span>';
+        '<span style="color:var(--danger,#B33D3D);">❌ 错误: ' + escapeHtml(payload.error) + '</span>';
       currentBotMsg = null;
     }
     currentReqId = null;
@@ -1334,7 +1555,7 @@ function injectGLMUI() {
       if (!res || !res.ok) {
         if (currentBotMsg) {
           currentBotMsg.classList.remove("glm-typing");
-          currentBotMsg.innerHTML = '<span style="color:#ef4444;">❌ 错误: ' + escapeHtml((res && res.error) || "未知错误") + '</span>';
+          currentBotMsg.innerHTML = '<span style="color:var(--danger,#B33D3D);">❌ 错误: ' + escapeHtml((res && res.error) || "未知错误") + '</span>';
           currentBotMsg = null;
         }
         currentReqId = null;
@@ -1345,7 +1566,7 @@ function injectGLMUI() {
     } catch (e) {
       if (currentBotMsg) {
         currentBotMsg.classList.remove("glm-typing");
-        currentBotMsg.innerHTML = '<span style="color:#ef4444;">❌ 异常: ' + escapeHtml(e.message) + '</span>';
+        currentBotMsg.innerHTML = '<span style="color:var(--danger,#B33D3D);">❌ 异常: ' + escapeHtml(e.message) + '</span>';
         currentBotMsg = null;
       }
       currentReqId = null;

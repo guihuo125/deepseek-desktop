@@ -84,6 +84,68 @@ const ESCAPE_PRIMITIVES = [
   { p: /\bProxy\b|\bReflect\b/,          desc: "元编程接口，可拦截并绕过沙箱检查" }
 ];
 
+// ============ 用户策略：只有删除类不可逆操作才确认 ============
+// 2026-10-24 用户明确要求：不要再因为管道、变量展开、非白名单命令、写文件弹窗，
+// 只有「删除文件」这类不可逆操作才需要确认。为了让这条策略不至于把系统关机、
+// 沙箱逃逸也一起放开，下面单独保留这些硬信号：
+//   · DESTRUCTIVE_INTENT —— 删除 / 关机 / 杀进程（用户最在意的「不可逆」集合）
+//   · ESCAPE_PRIMITIVES  —— 沙箱逃逸
+//   · 越界 / UNC / URL    —— 数据外泄
+// 其余 dangerous 在 finish() 里降级为 safe，自动执行。
+const DESTRUCTIVE_INTENT = [
+  { p: /\brm\b/i,              desc: "删除文件/目录" },
+  { p: /\brmdir\b/i,           desc: "删除目录" },
+  { p: /\brd\b/i,              desc: "删除目录" },
+  { p: /\bdel\b/i,             desc: "删除文件" },
+  { p: /\berase\b/i,           desc: "删除文件" },
+  { p: /\bunlink\b/i,          desc: "删除文件/链接" },
+  { p: /remove-item/i,         desc: "Remove-Item 删除文件/目录" },
+  { p: /\bdelete\s*\(/i,      desc: "调用删除 API" },
+  { p: /os\.remove\b/i,        desc: "os.remove 删除文件" },
+  { p: /shutil\.rmtree/i,      desc: "递归删除目录" },
+  { p: /\bshutdown\b/i,        desc: "关机" },
+  { p: /\brestart-computer\b/i,desc: "重启计算机" },
+  { p: /\bstop-computer\b/i,   desc: "关闭计算机" },
+  { p: /\btaskkill\b/i,        desc: "强制结束进程" },
+  { p: /\bstop-process\b/i,    desc: "结束进程" }
+];
+
+function hasDestructiveIntent(code) {
+  const src = String(code || "");
+  for (const d of DESTRUCTIVE_INTENT) {
+    if (d.p.test(src)) return true;
+  }
+  return false;
+}
+
+// 去掉字符串字面量，只留真正的代码。
+// 旧版逃逸检测直接扫含字符串的源码，pwsh("Get-Process ...") 里的 process
+// 会被误判成「访问宿主进程对象」——这正是用户截图里反复弹窗的来源之一。
+function stripStrings(code) {
+  let out = "";
+  let i = 0;
+  const n = code.length;
+  while (i < n) {
+    const c = code[i];
+    if (c === '"' || c === "'" || c === "`") {
+      i = skipString(code, i);
+      out += '""';
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+function hasEscapeIntent(code) {
+  const bare = stripStrings(code);
+  for (const e of ESCAPE_PRIMITIVES) {
+    if (e.p.test(bare)) return true;
+  }
+  return false;
+}
+
 // ============ JS 字符串字面量扫描 ============
 
 // 从 i（指向引号）开始，返回闭合引号之后的下标
@@ -396,36 +458,42 @@ function pathEscapeReason(cmd, workspace) {
 
 function classifyShell(cmd, flavor, options) {
   if (typeof cmd !== "string") {
-    return { ok: false, why: "命令不是字面量字符串（可能由变量拼接），无法静态审查" };
+    // 变量拼接后完全看不出真实命令，属于无法审查，保持确认
+    return { ok: false, hard: true, why: "命令不是字面量字符串（可能由变量拼接），无法静态审查" };
   }
   if (/[\r\n]/.test(cmd)) {
-    return { ok: false, why: "命令包含换行，等价于多条命令串联" };
+    return { ok: false, hard: false, why: "命令包含换行，等价于多条命令串联" };
   }
-  // shell 控制符 / 变量展开 / 命令分组 —— 任何一个都能改变命令的真实语义
-  if (/[|&;<>`$(){}!]/.test(cmd)) {
-    return { ok: false, why: "命令包含 shell 控制符或变量展开（| & ; < > ` $ ( ) { } !）" };
-  }
-  // UNC 路径会触发 SMB 认证，把本机 NTLM 凭据发给远端；URL 则可能外传数据
+  // UNC 路径会触发 SMB 认证，把本机 NTLM 凭据发给远端；URL 则可能外传数据。
+  // 这两条必须在控制符判定之前：Invoke-WebRequest 里本来就有 $env: 与括号，
+  // 先走控制符分支会把外联风险降级成普通语法噪音。
   if (/\\\\|\/\//.test(cmd)) {
-    return { ok: false, why: "命令包含 UNC 路径或 URL，可能触发凭据外泄或网络请求" };
+    return { ok: false, hard: true, why: "命令包含 UNC 路径或 URL，可能触发凭据外泄或网络请求" };
   }
   if (/(https?|ftp|file):/i.test(cmd)) {
-    return { ok: false, why: "命令包含网络/文件协议地址" };
+    return { ok: false, hard: true, why: "命令包含网络/文件协议地址" };
+  }
+  // shell 控制符 / 变量展开 / 命令分组：按用户要求不再弹窗，
+  // 但删除/关机等不可逆操作会在 finish() 里按整段源码再拦一次
+  if (/[|&;<>`$(){}!]/.test(cmd)) {
+    return { ok: false, hard: false, why: "命令包含 shell 控制符或变量展开（| & ; < > ` $ ( ) { } !）" };
   }
 
   const token = firstToken(cmd);
   // 去掉路径与扩展名，只留可执行名
   const exe = token.exe.split(/[\\/]/).pop().toLowerCase().replace(/\.(exe|com|bat|cmd|ps1)$/, "");
   const whitelist = flavor === "pwsh" ? PS_READONLY : CMD_READONLY;
-  if (!exe) return { ok: false, why: "无法解析出命令名" };
+  if (!exe) return { ok: false, hard: true, why: "无法解析出命令名" };
   if (!whitelist.has(exe)) {
-    return { ok: false, why: "`" + exe + "` 不在只读命令白名单内" };
+    // 用户要求「只有删除才弹」：非白名单命令也放行自动执行。
+    // 这是明确的策略选择，风险由 finish() 里的删除/逃逸检测兜底。
+    return { ok: false, hard: false, why: "`" + exe + "` 不在只读命令白名单内" };
   }
 
   const escape = pathEscapeReason(cmd, options && options.workspace);
-  if (escape) return { ok: false, why: escape };
+  if (escape) return { ok: false, hard: true, why: escape };
 
-  return { ok: true, exe: exe };
+  return { ok: true, hard: false, exe: exe };
 }
 
 // ============ 主入口 ============
@@ -433,11 +501,12 @@ function classifyShell(cmd, flavor, options) {
 function checkCode(code, options) {
   const result = { level: "safe", items: [] };
 
-  function add(level, cmd, desc) {
+  function add(level, cmd, desc, hard) {
     result.items.push({
       cmd: String(cmd == null ? "" : cmd).substring(0, 200),
       desc: desc,
-      level: level
+      level: level,
+      hard: !!hard
     });
     if (level === "forbidden") result.level = "forbidden";
     else if (level === "dangerous" && result.level !== "forbidden") result.level = "dangerous";
@@ -446,8 +515,8 @@ function checkCode(code, options) {
   const src = typeof code === "string" ? code : "";
   if (!src.trim()) {
     result.level = "dangerous";
-    add("dangerous", "(空)", "代码为空，无法判断意图");
-    return finish(result);
+    add("dangerous", "(空)", "代码为空，无法判断意图", false);
+    return finish(result, src);
   }
 
   // ---- 1. 绝对禁止：扫描去掉注释后的源码（字符串内容仍保留）----
@@ -455,13 +524,14 @@ function checkCode(code, options) {
   for (const f of FORBIDDEN) {
     if (f.p.test(scannable)) {
       add("forbidden", "(代码片段)", f.desc);
-      return finish(result);
+      return finish(result, src);
     }
   }
 
-  // ---- 2. 沙箱逃逸原语 ----
+  // ---- 2. 沙箱逃逸原语（只看代码，不看字符串内容，避免 Get-Process 这类误报）----
+  const bareCode = stripStrings(scannable);
   for (const e of ESCAPE_PRIMITIVES) {
-    if (e.p.test(scannable)) add("dangerous", "(代码片段)", e.desc);
+    if (e.p.test(bareCode)) add("dangerous", "(代码片段)", e.desc, true);
   }
 
   // ---- 3. 逐个工具调用判定 ----
@@ -475,14 +545,14 @@ function checkCode(code, options) {
       for (const f of FORBIDDEN) {
         if (f.p.test(arg.literal)) {
           add("forbidden", call.name + "(" + arg.literal + ")", f.desc);
-          return finish(result);
+          return finish(result, src);
         }
       }
     }
   }
 
   if (calls.length === 0) {
-    add("dangerous", "(代码片段)", "未识别到任何 cuckoo 工具调用，无法确认这段代码的意图");
+    add("dangerous", "(代码片段)", "未识别到任何 cuckoo 工具调用，无法确认这段代码的意图", false);
   }
 
   for (const call of calls) {
@@ -492,34 +562,47 @@ function checkCode(code, options) {
 
     if (MUTATING_TOOLS.has(name)) {
       const target = call.args[0] ? (call.args[0].literal || call.args[0].raw) : "(未知路径)";
+      // 写文件按用户要求不再确认（工作区边界仍由 runner.safePath 兜底）
       add("dangerous", name + "(" + target + ")",
-        name === "write" ? "写入/覆盖文件，会改变磁盘内容" : "修改文件内容，会改变磁盘内容");
+        name === "write" ? "写入/覆盖文件，会改变磁盘内容" : "修改文件内容，会改变磁盘内容", false);
       continue;
     }
 
     if (OPAQUE_TOOLS.has(name)) {
       add("dangerous", name + "(...)",
-        "Python 代码无法静态审查，可以执行任意系统操作（删文件、联网、提权）");
+        "Python 代码无法静态审查，可以执行任意系统操作（删文件、联网、提权）", false);
       continue;
     }
 
     if (SHELL_TOOLS[name]) {
       const arg = call.args[0];
       if (!arg) {
-        add("dangerous", name + "()", "缺少命令参数");
+        add("dangerous", name + "()", "缺少命令参数", false);
         continue;
       }
       const verdict = classifyShell(arg.literal, SHELL_TOOLS[name], options);
       if (verdict.ok) continue; // 只读白名单命令，放行
-      add("dangerous", name + "(" + (arg.literal != null ? arg.literal : arg.raw) + ")", verdict.why);
+      add("dangerous", name + "(" + (arg.literal != null ? arg.literal : arg.raw) + ")", verdict.why, verdict.hard);
       continue;
     }
   }
 
-  return finish(result);
+  return finish(result, src);
 }
 
-function finish(result) {
+function finish(result, code) {
+  // 用户策略（2026-10-24）：dangerous 里只要没有硬风险，就降级成自动执行。
+  // 硬风险 = 删除/关机/杀进程、沙箱逃逸、越界或外泄、无法静态审查的字面量。
+  const hard = result.items.some(function (it) {
+    return it.level === "dangerous" && it.hard;
+  });
+  if (result.level === "dangerous" && !hard &&
+      !hasDestructiveIntent(code) && !hasEscapeIntent(code)) {
+    result.level = "safe";
+    result.reasons = [];
+    result.relaxed = true;
+    return result;
+  }
   result.reasons = result.items.map(function (it) {
     return "操作: " + it.cmd + "\n风险: " + it.desc;
   });

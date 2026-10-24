@@ -1,0 +1,511 @@
+/* ============================================================================
+   Claude 风格主题 —— DeepSeek 网页注入层（themes/claude.css 的远程镜像）
+   ----------------------------------------------------------------------------
+   由主进程用 webContents.insertCSS(css, {cssOrigin:"user"}) 注入 chat.deepseek.com。
+   同一批变量、同一套色值：改色永远先改 claude.css 再同步到这里，反过来做会让壳层和
+   网页不像同一个应用。
+
+   ◆ 为什么这一版比上一版短得多
+     2026-10-24 用 CDP 在跑着的页面上逐条量命中数：main / article / aside / nav /
+     [role=banner] / [class*=prose] / [class*=markdown] / [class*=message-content]
+     全是 0 命中 —— 上一版 812 行里绝大部分规则是写给不存在的东西的。而"没命中"不等于
+     "无害"：流式输出时 DOM 一直在变，每条选择器都要反复参与重匹配，是纯成本。
+
+   ◆ 哈希类名一律禁止
+     _27c9245 / f8d1e4c0 这类是构建产物，每次发版重排。写进主题的后果不是"改版当天样式
+     失效"（那算好结果），而是"认错元素"—— 同一个哈希下一次可能落在正文上，我们的底色
+     就涂在段落上了；这类 bug 极难定位。只允许六类选择器：① HTML 元素/类型选择器
+     ② role / aria / contenteditable / placeholder 属性 ③ .ds-*（他们样式表
+     main.cc59a63cb5.css 里的设计系统契约前缀）④ .the-header（全站唯一的语义布局类）
+     ⑤ div:has(> textarea) 结构探测（实测命中 1）⑥ [data-ds-region] / [data-ds-hidden]
+     （preload.js 按几何与文案事实打的标记）
+
+   ◆ 真正的杠杆：接管他们自己的令牌（§2）
+     实测 DeepSeek 全站颜色不写在组件类上，而是 body 上声明的两批令牌，组件只转发 var()：
+     画布 = var(--dsw-alias-bg-base)，用户气泡 = var(--dsw-specific-bubble)，按钮面 =
+     --dsl-button-color → --dsw-alias-button-primary-fill，连 logo 鲸鱼都是
+     fill:var(--dsw-alias-brand-primary)。⇒ 把这批令牌指到我们的色板，"纯白→米白、蓝→
+     赤陶"一次性全站生效：不碰哈希类名、不碰 BEM 子层。代价是这批声明必须逐条带
+     !important —— 原因见下面那条★，别被"我们是 user origin"误导。这也是唯一
+     能涂到侧栏与用户气泡这两块大面积冷色的办法 —— 它们除了哈希类名什么都没有。
+     ★ 为什么每条都要 !important（这里曾经写反，害得衬线标题空转了两轮）：
+     CSS Cascade 4 的普通声明优先级是【作者 > 用户 > UA】，只有 important 那一半反过来
+     （UA > 用户 > 作者）。insertCSS 的 cssOrigin:"user" 只决定我们站在「用户」这一档，
+     普通声明照样输给作者的普通声明。⇒ 接管令牌必须逐条 !important，字体族同理（宿主用
+     font: 简写在同一元素上声明）。这不是"没找到钩子"，是这一档层叠的固有规则。
+     好消息：important-user 高于 important-author，所以他们写 !important 也压不住我们。
+
+   ◆ 不写 @font-face、不写任何 url()：'Inter' / 'Source Serif 4' 由主进程用
+     new FontFace(family, bytes) 运行时注册（document.fonts 报 loaded），不产生资源请求，
+     CSP 无从拦截。远程页面上相对路径解析不到 asar，file:// 被隐私拦，data: 受页面
+     font-src 管。这里只写 font-family，取不到自然回退系统栈，不会坏版。
+
+   ◆ 深色写两份（§12，两份必须逐字一致）：一份在 @media (prefers-color-scheme: dark) 里
+     跟 nativeTheme（主进程设 themeSource），一份在 html.dark / .dark /
+     body[data-ds-dark-theme] 上跟 DeepSeek 自己的开关（实测它的深色宿主）。两个开关不
+     保证同步，只发一份会出现"它是黑的、我是白的"。深色段只换变量、不写规则本体：本体在
+     浅色段，且 §2 指向的是【变量】而非【色值】，变量一翻深色，转发它的组件全跟着翻。
+
+   ◆ 三条硬约束：① 颜色一律来自变量，变量在浅/深两段成对翻转（旧版把 h1/h2 硬写成浅色，
+     深色下直接读不出来）；② !important 只出现在 IMP-n 标注处；③ 过渡只碰
+     color/background-color/border-color/box-shadow/transform/opacity，不给 * 或超大
+     命中集写动画。
+   ========================================================================== */
+
+/* == 1. 令牌：与 themes/claude.css 同名同值（浅色 = 默认）==================
+   名字够具体（bg-canvas / accent-soft 一档），撞车概率很低。真撞上了不要改名 ——
+   改名等于脱离设计源，应该把冲突上报给维护 claude.css 的人。 */
+:root {
+  color-scheme: light;   /* 让原生控件、表单默认色、滚动条先站到浅色这边 */
+  /* 表面：从外到内逐级提亮，靠色差分层而不是阴影。刻意没有纯白 */
+  --bg-canvas: #FAF9F5;   --bg-surface: #FDFCFA;   --bg-subtle: #F0EEE6;
+  --bg-raised: #E8E6DE;   --bg-address: #F5F4EF;   --bg-inverse: #141413;
+  --text-primary: #141413;  --text-secondary: #5E5D59; --text-tertiary: #83827D;
+  --text-disabled: #B0AEA5; --text-inverse: #FAF9F5;
+  /* 描边：Claude 的分层主要靠 1px 暖色描边，不靠投影 */
+  --border-default: #E3DACC;  --border-strong: #D1CFC5;  --border-focus: #C9C7BE;
+  /* 强调色：赤陶橙。不是亮橙，更不是他们的 #3964fe。accent-text = 浅底上的强调字 */
+  --accent: #D97757;      --accent-hover: #C15F3C;   --accent-active: #A94E2E;
+  --accent-soft: #F5E5DE; --accent-text: #B0491F;
+  --blue: #6A9BCC; --green: #788C5D; --danger: #B33D3D; --danger-soft: #F7E8E6;
+  /* 阴影：极淡，只用于浮层脱离页面 */
+  --shadow-sm: 0 1px 2px rgba(20,20,19,.04);  --shadow-md: 0 4px 16px rgba(20,20,19,.06);
+  --shadow-lg: 0 12px 40px rgba(20,20,19,.10);
+  --scroll-thumb: #D1CFC5; --scroll-track: transparent;
+  /* 代码块不再用独立的深色石板：宿主的高亮 token 是按它自己的浅色底写的，
+     强行换深底会出现「深底深字」（2026-10-24 用户实测截图）。统一走 --bg-subtle
+     底板 + --text-primary 正文，浅深两档都跟主题走，语法高亮也保持协调。 */
+  /* 排版：只声明字体族，不写 @font-face（见文件头）。
+     ★ 名字一律带 --dsc- 前缀，不用 --font-serif / --font-ui：DeepSeek 自己也定义了同名
+       令牌并在组件层（.ds-markdown、.e37a04e4 的 font 简写等）重新声明。自定义属性按
+       「继承链上最近的一处」取值，组件在内层重声明后，我们的 h1-h6 规则虽然匹配赢了，
+       var() 拿到的却是他们的值 —— 症状是标题仍是 Inter。换个不撞的名字才有解。 */
+  --dsc-sans:  'Inter', -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+  --dsc-serif: 'Source Serif 4', Georgia, 'Times New Roman', 'Songti SC', 'SimSun', serif;
+  --dsc-mono:  'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  --tracking-tight: -0.02em; --leading-body: 1.65;
+  --text-xs: 11px; --text-sm: 12.5px; --text-md: 14px; --text-lg: 15px; --text-xl: 17px; --text-2xl: 21px;
+  /* 形状与间距：圆角比常见 UI 大一档（Claude 的卡片明显圆润），按钮保持中等 */
+  --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px; --radius-xl: 20px; --radius-pill: 999px;
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 28px;
+  /* 动效：短、缓出、无回弹。超过 260ms 就显拖沓 */
+  --ease-out: cubic-bezier(0.16, 1, 0.30, 1); --ease-soft: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur-fast: 120ms; --dur-base: 180ms; --dur-slow: 260ms;
+}
+
+/* == 2. 接管 DeepSeek 的令牌（本文件的杠杆所在）=============================
+   宿主为什么是 body：实测他们两批令牌都声明在 body 上，深色那份在 body[data-ds-dark-theme]
+   上。同名同宿主 + user origin ⇒ 稳定压过；两个宿主都列出，保证他们走深色开关时我们仍然
+   说了算。值全指向 §1 的变量 ⇒ 浅/深自动跟随，这一段【不需要】在深色段里重复。
+   刻意不碰 --dsw-static-*（他们的原始色阶）：那是调色板的底座，改一处会波及阴影、渐变、
+   插画等我们没量过的地方 —— 属于"一次改动换一百处未知"。warn / success 这类状态色也保留
+   他们的（Claude 也不改语义状态色，克制）。
+   ⚠ 这一段必须逐条 !important。级联顺序是 normal-author > normal-user，他们的令牌是
+     body 上的普通声明，光靠"我们也是 body、user origin"压不住；只有 important 侧
+     （important-user > important-author）才稳定接管。下面 72 条没有一条漏挂，
+     加新令牌时也别漏 —— 漏一条不会报错，只会静默沿用宿主原色。
+     （2026-10-24 复审：早前这里写过"不需要 !important"和一条相反实测，结论是错的，
+     已按 Cascade 4 校正；代码一直是 !important，只有注释说反了。） */
+body,
+body[data-ds-dark-theme] {
+  /* 场景层 —— "只有哈希类名的大面积冷色"唯一的出路 */
+  --dsw-specific-input-major: var(--bg-surface) !important;            /* 输入卡片 */
+  --dsw-specific-bubble: var(--accent-soft) !important;                /* 用户消息气泡（原淡蓝）*/
+  --dsw-specific-bubble-highlight: var(--bg-raised) !important;
+  --dsw-specific-sidebar-fill: var(--bg-subtle) !important;            /* 侧栏底（原冷白 #f9fafb）*/
+  --dsw-specific-sidebar-nav-item-active: var(--bg-raised) !important;
+  --dsw-specific-sidebar-nav-item-active-accent: var(--accent-soft) !important;
+  --dsw-specific-sidebar-nav-item-hover: var(--bg-raised) !important;
+  --dsw-specific-selector: var(--bg-raised) !important;                /* 模型 / 下拉选择器 */
+  --dsw-specific-menu: var(--bg-surface) !important;
+  --dsw-specific-tip: var(--bg-subtle) !important;
+  --dsw-specific-login-input: var(--bg-surface) !important;
+
+  /* 语义层 · 表面。遮罩原本是他们硬写的 rgba(0,0,0,.24) 纯黑，压在暖底上会发灰发脏，
+     所以换成 Ink 的半透明 —— 深色档里 --bg-inverse 翻成米白，遮罩自动变浅。 */
+  --dsw-alias-bg-base: var(--bg-canvas) !important;
+  --dsw-alias-bg-layer-1: var(--bg-surface) !important; --dsw-alias-bg-layer-2: var(--bg-surface) !important;
+  --dsw-alias-bg-layer-3: var(--bg-subtle) !important;  --dsw-alias-bg-overlay: var(--bg-subtle) !important;
+  --dsw-alias-bg-module-platform: var(--bg-subtle) !important; --dsw-alias-bg-multi-select: var(--bg-raised) !important;
+  --dsw-alias-bg-skeleton: color-mix(in srgb, var(--text-primary) 7%, transparent) !important;
+  --dsw-alias-tooltip-bg: var(--bg-inverse) !important; --dsw-alias-toast-bg: var(--bg-inverse) !important;
+  --dsw-alias-bg-mask-1: color-mix(in srgb, var(--bg-inverse) 14%, transparent) !important;
+  --dsw-alias-bg-mask-2: color-mix(in srgb, var(--bg-inverse) 26%, transparent) !important;
+  --dsw-alias-bg-mask-3: color-mix(in srgb, var(--bg-inverse) 44%, transparent) !important;
+
+  /* 语义层 · 文字 */
+  --dsw-alias-label-primary: var(--text-primary) !important;     --dsw-alias-label-primary-dimmed: var(--text-secondary) !important;
+  --dsw-alias-label-secondary: var(--text-secondary) !important; --dsw-alias-label-tertiary: var(--text-tertiary) !important;
+  --dsw-alias-label-caption: var(--text-tertiary) !important;    --dsw-alias-label-dimmed: var(--border-strong) !important;
+  --dsw-alias-label-primary-inverted: var(--text-inverse) !important; --dsw-alias-label-primary-foreground: var(--text-inverse) !important;
+
+  /* 语义层 · 描边：他们的 l1~l4 是带蓝的透明黑（neutral-bluish 系）→ 全换暖沙 */
+  --dsw-alias-border-l1: var(--border-default) !important; --dsw-alias-border-l2: var(--border-strong) !important;
+  --dsw-alias-border-l2-darkmode-thin: var(--border-strong) !important; --dsw-alias-border-l3: var(--border-strong) !important;
+  --dsw-alias-border-l4: var(--border-focus) !important;
+
+  /* 语义层 · 品牌/强调：#3964fe 全家桶 → 赤陶橙。这一组同时管住主按钮、焦点环、svg
+     图标（含 logo 鲸鱼）、链接色和输入光标 —— 全靠 var() 转发，一处组件类都不碰。 */
+  --dsw-alias-brand-primary: var(--accent) !important; --dsw-alias-brand-primary-invert: var(--accent-text) !important;
+  --dsw-alias-brand-text: var(--accent-text) !important;
+  --dsw-alias-button-primary-fill: var(--accent) !important; --dsw-alias-button-primary-hover: var(--accent-hover) !important;
+  --dsw-alias-button-primary-dimmed: var(--accent-soft) !important;
+  --dsw-alias-button-info-fill: var(--accent) !important;   --dsw-alias-button-info-hover: var(--accent-hover) !important;
+  --dsw-alias-button-elevated-fill: var(--bg-surface) !important;  --dsw-alias-button-floating-fill: var(--bg-surface) !important;
+  --dsw-alias-button-floating-hover: var(--bg-subtle) !important;  --dsw-alias-button-contrast-fill: var(--bg-inverse) !important;
+  --dsw-alias-button-ghost-active-fill: var(--accent-soft) !important; --dsw-alias-button-ghost-active-hover: var(--bg-raised) !important;
+  --dsw-alias-button-ghost-active-border: color-mix(in srgb, var(--accent) 45%, transparent) !important;
+  --dsw-alias-state-business-primary: var(--accent) !important; --dsw-alias-state-business-tertiary: var(--accent-soft) !important;
+  --dsw-alias-state-error-primary: var(--danger) !important;   --dsw-alias-state-error-secondary: var(--danger) !important;
+
+  /* 语义层 · 交互态：他们的 rgba(38,49,72,.06) 是带蓝的灰，hover 时整块会发冷 */
+  --dsw-alias-interactive-bg-hover: color-mix(in srgb, var(--text-primary) 5%, transparent) !important;
+  --dsw-alias-interactive-bg-hover-accent: color-mix(in srgb, var(--accent) 12%, transparent) !important;
+  --dsw-alias-interactive-bg-hover-solid: var(--bg-subtle) !important;
+  --dsw-alias-interactive-bg-active: color-mix(in srgb, var(--text-primary) 9%, transparent) !important;
+
+  /* 语义层 · 代码：暖墨板，不是突兀的冷白 #f9fafb */
+  --dsw-alias-markdown-code-block: var(--bg-subtle) !important; --dsw-alias-markdown-code-block-banner: var(--bg-raised) !important;
+  --dsw-alias-markdown-inline-code: var(--bg-raised) !important; --dsw-alias-markdown-citation: var(--bg-raised) !important;
+  --dsw-alias-markdown-placeholder: var(--bg-subtle) !important; --dsw-alias-markdown-tag: var(--bg-subtle) !important;
+  --dsw-alias-markdown-code-segment-selected: var(--bg-surface) !important;
+  --dsw-alias-markdown-code-segment-unselected: transparent !important;
+
+  /* 语义层 · 滚动条：他们 ds-scroll-area 自绘那套也走 alias */
+  --dsw-alias-scrollbar-bg-l1: var(--scroll-thumb) !important;    --dsw-alias-scrollbar-bg-l2: var(--scroll-thumb) !important;
+  --dsw-alias-scrollbar-hover-l1: var(--border-focus) !important; --dsw-alias-scrollbar-hover-l2: var(--border-focus) !important;
+}
+
+
+/* == 3. 页面底 · 基础排版 ===================================================
+   ★ background-color 必须带 !important：实测深色档下 body 停在 rgb(255,255,255)，
+     即 §2 的 --dsw-alias-bg-base 没能管住画布（他们深色那份挂在
+     body[data-ds-dark-theme] 上，宿主特异性比我们的 body 高）。user 普通声明
+     压不住作者源的这条，只有 user !important 可以。浅色下看不出问题，所以
+     这条容易被当成冗余删掉 —— 别再删。
+   文字色不加 !important：让页面自己的语义色（错误红、链接色）继续生效，
+   我们只负责「什么都没标色」的地方落到 Ink 上。 */
+html, body { background-color: var(--bg-canvas) !important; color: var(--text-primary); }
+body { -webkit-font-smoothing: antialiased; }   /* Windows 下让中文走灰度抗锯齿，更接近纸面 */
+/* 界面与正文一律 Inter，只有标题走衬线 —— 和 claude.css 的分工一致，不要反过来。
+   ★ font-family 全部要 !important：宿主用 `font:` 简写（.e37a04e4 { font: var(--dsw-font-*) }）
+     在同一元素上声明字体。CSS Cascade 4 的普通声明顺序是 作者 > 用户 > UA，我们这条
+     user 普通声明是输的一方 —— 不加 !important 时实测 computed 仍停在 Inter，且页面
+     不报任何错，看起来像"改了没反应"。 */
+body, input, textarea, select, button { font-family: var(--dsc-sans) !important; caret-color: var(--accent); }
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--dsc-serif) !important; color: var(--text-primary); font-weight: 500;
+  letter-spacing: var(--tracking-tight); line-height: 1.28;
+}
+p, li, dd, blockquote { line-height: var(--leading-body); }
+
+
+/* == 4. 顶栏 ================================================================
+   实测 .the-header 自己是 background-color:transparent —— 看到的白是背后的画布透出来的，
+   所以顶栏暖色主要归 §2 管（深色下它是 rgb(21,21,23) 冷黑，同样由画布翻暖）。这里补上
+   Claude 式的发丝分隔线，并清掉毛玻璃（半透明+模糊压在米白上会发灰）。 */
+.the-header {
+  background-color: var(--bg-canvas); border-bottom: 1px solid var(--border-default);
+  color: var(--text-primary); box-shadow: none; backdrop-filter: none;
+}
+.the-header :is(h1, h2, h3, strong) { color: var(--text-primary); font-weight: 600; }
+.the-header .ds-icon { color: var(--text-secondary); }
+
+
+
+/* 顶栏的会话标题实测是 div（不是 h1-h6），所以 h 标签那条规则管不到它。
+   :not(:has(*)) 是「没有后代的元素」= 叶子，用它精准命中那一个标题。 */
+.the-header div:not(:has(*)) {
+  font-family: var(--dsc-serif) !important;
+  font-weight: 500;
+  letter-spacing: var(--tracking-tight);
+}
+
+/* == 5. 左侧会话栏 ==========================================================
+   暖灰底 + 1px 右描边有两条路径，故意都写：§2 的 --dsw-specific-sidebar-fill 管"底色
+   本身"（不依赖任何标记）；这里管"层次关系"（文字分级、hover、分隔线）—— 只有 preload
+   的几何标记能告诉我们哪一块是侧栏。标记没落地时这里命中 0 个元素，是刻意的降级。
+   只挑语义上确定次要的标签；刻意不用 [aria-hidden] 这类大范围启发式 —— 那会把主标题也
+   涂成三级色，等于自己造一个读不出来的坑。 */
+[data-ds-region="side"] {
+  background-color: var(--bg-subtle); border-right: 1px solid var(--border-default);
+  color: var(--text-secondary);
+}
+[data-ds-region="side"] :is(a, [role="button"], button) { color: var(--text-secondary); }
+[data-ds-region="side"] :is(a, [role="button"], button):hover { background-color: var(--bg-raised); color: var(--text-primary); }
+[data-ds-region="side"] :is(a, [role="button"], button):active { background-color: var(--bg-raised); }
+[data-ds-region="side"] :where(small, time, label) { color: var(--text-tertiary); }
+[data-ds-region="side"] hr { border: none; border-top: 1px solid var(--border-default); }
+
+
+/* == 6. 阅读栏：窄、居中 ====================================================
+   消息滚动容器实测是 div.ds-virtual-list（overflow-y:auto）。列宽不是写死的：内层用
+   padding-left: calc((100% - var(--message-width)) / 2) 自己算居中 —— 正确的钩子是喂它
+   这个变量，让它的居中逻辑继续工作（实测喂 46rem 后列宽从 648 变成 736 且仍居中）。
+   ⚠ 不要再给子元素加 margin-inline:auto：会和它自己的 padding 居中叠加，实测整列被推离
+     中心 ~158px，输入卡片和消息还会互相错位。
+   ⚠ 也不要给 .ds-virtual-list 加 padding-inline：它是 width:100% 的滚动容器，加内边距
+     会把内容顶出视口（右侧消息被裁掉）。
+   max-width 是兜底：万一哪天他们不再用这个变量算宽度，列宽仍有上限。 */
+/* --message-width 是他们自己算列宽/居中用的变量（实测喂进去之后消息列从 648 变成 736
+   且仍然居中）。只喂这一颗，让它的居中逻辑继续工作。
+   ⚠ 不要给子元素加 max-width：实测会把列卡住、和它自己的 padding 居中打架。
+   ⚠ 也不要给子元素加 margin-inline:auto：与 padding 叠加，实测整列被推离中心 ~158px。
+   ⚠ 也不要给 .ds-virtual-list 加 padding-inline：它是 width:100% 的滚动容器，加内边距会
+     把内容顶出视口（右侧消息被裁掉）。 */
+.ds-virtual-list { --message-width: min(46rem, 100%); background-color: transparent; color: var(--text-primary); }
+.ds-virtual-list :is(p, li) { line-height: var(--leading-body); }
+.ds-virtual-list :is(h1, h2, h3, h4, h5, h6) { font-family: var(--dsc-serif) !important; letter-spacing: var(--tracking-tight); }
+
+
+/* == 7. 正文内容元素 ========================================================
+   全用元素/类型选择器：命中集小、不会认错元素、改版也不会错乱。 */
+/* 链接：Claude 的链接是低饱和暖色，不是蓝。--accent-text 专门保证浅底对比度，深色段里
+   它成对翻转成浅橙，所以不会出现"深底压深字"。 */
+a {
+  color: var(--accent-text);
+  text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  text-underline-offset: 2px;
+}
+a:hover { color: var(--accent-hover); text-decoration-color: var(--accent-hover); }
+/* 顶栏标题、侧栏条目也是 <a>，但它们是导航不是正文链接 —— 写在后面靠顺序翻回来（同特异
+   度后者胜，不需要 !important）。侧栏条目整片涂成橙属于"自己制造读不出来"那一类错。 */
+.the-header a, [data-ds-region="side"] a { color: var(--text-secondary); text-decoration: none; }
+.the-header a:hover, [data-ds-region="side"] a:hover { color: var(--text-primary); }
+
+blockquote {
+  border-left: 2px solid var(--border-strong); color: var(--text-secondary);
+  padding-left: var(--space-4); background-color: transparent;
+}
+hr { border: none; border-top: 1px solid var(--border-default); }
+/* 表格：Claude 只有发丝横线，没有外框。只改 border-color，不动 border-style/width
+   —— 改盒模型会重排。 */
+table, th, td { border-color: var(--border-default); }
+th { color: var(--text-secondary); background-color: var(--bg-subtle); font-weight: 600; }
+
+code, kbd, samp, pre { font-family: var(--dsc-mono) !important; }
+/* 代码块：浅一档的暖色底板 + 正文色，跟着主题走。
+   ★ 必须 !important：宿主给自己的代码块文字/背景都带了 !important，
+     普通声明会被压住，症状是「深底深字」完全看不清（用户实测截图）。
+   块内 span 的语法高亮仍然不碰，保留宿主的高亮配色。 */
+pre {
+  background-color: var(--bg-subtle) !important;
+  color: var(--text-primary) !important;
+  border: 1px solid var(--border-default); border-radius: var(--radius-md);
+}
+pre code { background: transparent; padding: 0; color: inherit; }
+/* 行内 code 做成小芯片：--bg-raised 在两个模式下都是"比页面重一档" */
+:not(pre) > code {
+  font-size: .9em; background-color: var(--bg-raised); color: var(--text-primary);
+  border-radius: var(--radius-sm); padding: 2px 6px;
+}
+kbd { background-color: var(--bg-subtle); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); color: var(--text-secondary); }
+img { background-color: transparent; }
+
+
+/* == 8. 输入区 ==============================================================
+   实测 div:has(> textarea) 命中 1 个，是 textarea 的【直接父级】= 只有打字那一行
+   （671x60），不是整张卡片；卡片在它上面两层（672x123，圆角 24px）。未聚焦时卡片走
+   --dsw-specific-input-major（§2 已指到米白）；聚焦时他们换上一条硬编码的白。
+   IMP-1（本文件唯一一处 !important）—— 证据：实测作者源里存在
+     ._9996a53 { background-color: rgba(255,255,255,.88) !important }  聚焦态卡片
+     ._24fad49 { background-color: #fff !important }                    打字行
+   层叠顺序里「作者源 !important」高于「用户源普通声明」，这是 user origin 唯一压不住的一
+   档，只能对等加「用户源 !important」（它才是最高的）。两层用同一个值：整体就是一块米白
+   卡片，不做"盒中盒"的双层边框。
+   ⚠ 这两层只能用结构探测命中（哈希类名禁止），所以"他们多加一层 div"就会让这条失效；
+     失效的后果是输入区回到纯白 —— 可接受的降级，比写死哈希好。 */
+/* 两层共用一个 !important 声明（IMP-1）：打字行和它外面那张卡片都要盖掉硬编码的白。
+   描边/圆角只给外层 —— 两层都画一圈就会看到"盒中盒"的双边框（实测截图里输入区上方
+   多出一道弧线），内层只要和外面同色、不画阴影。 */
+div:has(> div > div > textarea),
+div:has(> textarea) { background-color: var(--bg-surface) !important; }   /* IMP-1 */
+
+div:has(> div > div > textarea) {
+  border-radius: var(--radius-xl);
+  /* 描边用 inset 阴影而不是 border：不占盒模型、不触发重排，只有描边在变 */
+  box-shadow: inset 0 0 0 1px var(--border-strong), var(--shadow-sm);
+}
+div:has(> textarea) { border-radius: inherit; box-shadow: none; }
+div:has(> div > div > textarea):focus-within {
+  box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+textarea, input[type="text"], input[type="search"], input:not([type]), [contenteditable="true"] {
+  background-color: transparent; color: var(--text-primary);
+  caret-color: var(--accent);                       /* 光标用强调色：Claude 的签名细节 */
+  border-color: var(--border-strong);
+}
+textarea::placeholder, input::placeholder { color: var(--text-tertiary); opacity: 1; }
+[contenteditable="true"]:empty::before { color: var(--text-tertiary); }
+/* 自动填充：Chrome 会强行刷成黄底白字，用 inset 阴影把暖色盖回去 */
+input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text-primary);
+  -webkit-box-shadow: inset 0 0 0 1000px var(--bg-surface);
+  caret-color: var(--accent);
+}
+input[type="checkbox"], input[type="radio"], select { accent-color: var(--accent); }
+
+
+/* == 9. 按钮 ================================================================
+   实测他们的按钮是 div[role=button].ds-button，底色画在 .ds-button__background 这一层
+   （background-color: var(--dsl-button-color)），而 --dsl-button-color 由
+   .ds-button--primary/--filled 转发到 --dsw-alias-button-primary-fill。
+   ⇒ §2 已经把那颗 alias 指到赤陶橙，所以这里【不碰 __background 子层】、也不需要
+     !important —— 按钮底色、hover 渐变、焦点环一起跟着翻。下面只补令牌管不到的部分。
+   白字压在 --accent(#D97757) 上约 3.2:1，只够按钮这种大号加粗文字（AA large）；正文里的
+   强调文字一律走 --accent-text，不用这一档。 */
+.ds-button { color: var(--text-secondary); }
+.ds-button .ds-button__icon, .ds-button .ds-icon { color: inherit; }
+.ds-button--primary, .ds-button--filled { color: var(--text-inverse); }
+.ds-button--primary .ds-icon, .ds-button--filled .ds-icon { color: var(--text-inverse); }
+.ds-button--primary:active, .ds-button--filled:active { background-color: var(--accent-active); }
+.ds-button--error { background-color: var(--danger); color: var(--text-inverse); }
+.ds-button--warning { background-color: var(--accent-active); color: var(--text-inverse); }
+.ds-button--outlined { background-color: transparent; color: var(--text-primary); }
+.ds-button--outlined .ds-button__border { border-color: var(--border-strong); }
+.ds-button--text, .ds-button--borderless { background-color: transparent; color: var(--text-secondary); }
+.ds-button--text:hover { color: var(--text-primary); }
+/* 幽灵/图标按钮的 hover 底：刻意排除 primary/filled/error —— 全局 button:hover 会把发送
+   按钮的强调色洗成灰色（旧版就是这么坏的）。:where() 把这条的特异度归零，只靠顺序生效。 */
+:where(.ds-button:not(.ds-button--primary):not(.ds-button--filled):not(.ds-button--error)):hover {
+  background-color: var(--bg-subtle); color: var(--text-primary);
+}
+/* 禁用态只压文字，不铺底：按钮的面由 §2 的 alias 管，这里再盖一层暖灰会把发送键的赤陶
+   洗成灰斑（实测按钮根节点与 __background 是两层，后者盖在前者上面）。 */
+.ds-button--disabled,
+:where(button, [role="button"])[disabled],
+:where(button, [role="button"])[aria-disabled="true"] { color: var(--text-disabled); }
+
+/* 开关胶囊（深度思考 / 联网搜索）：实测点一次只有 aria-pressed 和一个哈希类在变，用前者
+   —— 它是语义属性，不随构建变；--selected 一并写上兜住另一套实现。两态要一眼分得开：
+   未激活 = 中性字；激活 = 强调色浅底 + 强调字 + 暖描边。 */
+.ds-toggle-button { color: var(--text-secondary); }
+.ds-toggle-button .ds-icon, .ds-toggle-button .ds-toggle-button__icon { color: var(--text-tertiary); }
+.ds-toggle-button[aria-pressed="true"], .ds-toggle-button[aria-checked="true"], .ds-toggle-button--selected {
+  background-color: var(--accent-soft); color: var(--accent-text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.ds-toggle-button[aria-pressed="true"] .ds-icon, .ds-toggle-button--selected .ds-icon { color: var(--accent); }
+
+:where([role="navigation"], [role="toolbar"], [role="menu"]) :is(button, [role="button"]):hover {
+  background-color: var(--bg-subtle); color: var(--text-primary);
+}
+:where(button, [role="button"]):active { transform: translateY(1px); }   /* 只动 transform */
+/* 用户气泡的面已由 §2 的 --dsw-specific-bubble 转暖；这两条只管文字落点，以及 preload
+   按文案抹掉的页面装饰（"内容由 AI 生成"那一行）。 */
+[data-ds-region="bubble"] { color: var(--text-primary); }
+[data-ds-hidden="1"] { display: none !important; }   /* 二值接管，必须压过作者的 display */
+
+
+/* == 10. 焦点环 / 浮层 ======================================================
+   .ds-focus-ring 的环色是 --dsl-focus-ring-color: var(--dsw-alias-button-primary-fill)，
+   §2 已经把它翻成赤陶橙。这里刻意【不】重写它的 box-shadow —— 环的几何（扩散、inset、
+   --on 开关）由他们控制，覆盖会把 focus 动画做坏。再额外给一条键盘焦点的暖 outline，
+   保证某个组件没走 focus-ring 时也不裸奔。 */
+.ds-focus-ring { color: var(--accent); }
+:where(button, [role="button"], [role="menuitem"], [role="option"], a, textarea,
+       input, select, [contenteditable="true"]):focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+/* 浮层是这份样式里唯一允许"脱离页面"的地方，才用得起阴影；其余全靠色差 + 1px 描边 */
+:where([role="dialog"], [role="alertdialog"], [aria-modal="true"]) {
+  background-color: var(--bg-surface); border: 1px solid var(--border-default);
+  color: var(--text-primary); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+}
+:where([role="menu"], [role="listbox"], [role="option"], [role="menuitem"]) {
+  background-color: var(--bg-surface); color: var(--text-primary);
+}
+/* 键盘高亮项：Radix 用 data-highlighted，其它库用 aria-selected，两条都写 */
+:where([role="menu"], [role="listbox"]) :is([role="menuitem"], [role="option"]):hover,
+:where([role="menu"], [role="listbox"]) :is([data-highlighted], [aria-selected="true"]),
+[role="tab"][aria-selected="true"] { background-color: var(--accent-soft); color: var(--text-primary); }
+/* tooltip：Claude 的提示条是反白的（浅底上是一块 Ink）。写在 surface 组之后，同特异度
+   后者胜，不需要 !important。 */
+[role="tooltip"] {
+  background-color: var(--bg-inverse); color: var(--text-inverse);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+}
+.ds-notification, .ds-notification-container {
+  background-color: var(--bg-surface); border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); color: var(--text-primary);
+}
+.ds-loading { color: var(--accent); }
+
+
+/* == 11. 选区 / 滚动条 / 过渡 ============================================== */
+::selection {
+  /* 只给底色、不写 color：文字保持它本来的颜色，浅底深字 / 深底浅字都天然可读
+     （旧版在这里写了 color，深色下选中文字和底色同色，直接看不见）。 */
+  background-color: var(--accent-soft);
+}
+/* 只用 ::-webkit-scrollbar-*。刻意【不】设 scrollbar-width / scrollbar-color：
+   Chromium 一旦看到这两个标准属性非 auto，就会无视下面所有自定义伪元素，自相残杀。
+   （他们 ds-scroll-area 自绘的那套滚动条由 §2 的 alias 接管） */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--scroll-track); }
+::-webkit-scrollbar-thumb {
+  background-color: var(--scroll-thumb); border-radius: var(--radius-pill);
+  border: 3px solid transparent; background-clip: content-box;   /* 缩成发丝，不占内容区 */
+}
+::-webkit-scrollbar-thumb:hover { background-color: var(--border-focus); }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* 命中集刻意限制在交互元素这一小撮，不写 * 通配；列出的属性全都不引发重排 */
+:where(a, .ds-button, .ds-toggle-button, [role="button"], [role="menuitem"], [role="option"],
+       textarea, input, [contenteditable="true"], div:has(> textarea)) {
+  transition: color var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-base) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+}
+@media (prefers-reduced-motion: reduce) {
+  /* 同样不用 * 通配 —— 远程页面动辄上万节点，通配动画是性能坑。只关我们自己开的那批。 */
+  :where(a, .ds-button, .ds-toggle-button, [role="button"], [role="menuitem"], [role="option"],
+         textarea, input, [contenteditable="true"], div:has(> textarea)) { transition-duration: 1ms; }
+}
+
+
+/* ============================================================================
+   == 12. 深色：两份，必须逐字一致 ===========================================
+   ① @media (prefers-color-scheme: dark) 跟 nativeTheme（主进程设 themeSource）；
+   ② html.dark / .dark / body[data-ds-dark-theme] 跟 DeepSeek 自己的开关。
+   两条路径不保证同步，所以都要发。两份之间的任何差异，最后都会表现成"某个组合下页面一半
+   深一半浅" —— 那是最难查的一类 bug。只换变量、不写规则本体：本体在浅色段，靠 var() 自动
+   翻到深色。值与 themes/claude.css 的 [data-theme="dark"] 逐字一致。
+   深色同样偏暖：底不是 #000 也不是冷灰，而是带黄褐的深灰。
+   ========================================================================== */
+
+/* —— 深色 · 路径 ① —— */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg-canvas: #262624;   --bg-surface: #2F2E2B;   --bg-subtle: #3A3835;
+    --bg-raised: #454340;   --bg-address: #2A2927;   --bg-inverse: #F5F4EF;
+    --text-primary: #F5F4EF;  --text-secondary: #B8B4A8; --text-tertiary: #8A877D;
+    --text-disabled: #6B6963; --text-inverse: #141413;
+    --border-default: #3D3B37;  --border-strong: #4A4843;  --border-focus: #5C5A54;
+    --accent: #E08C6A;      --accent-hover: #F09C7A;   --accent-active: #C97656;
+    --accent-soft: #3D2E27; --accent-text: #EDA987;
+    --blue: #7FA9D4; --green: #93A878; --danger: #D97757; --danger-soft: #43241F;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.30);  --shadow-md: 0 4px 16px rgba(0,0,0,.40);
+    --shadow-lg: 0 12px 40px rgba(0,0,0,.55);
+    --scroll-thumb: #4A4843; --scroll-track: transparent;
+  }
+}
+
+/* —— 深色 · 路径 ②：声明必须与上面 @media 内那一份完全相同，只有宿主不同 —— */
+html.dark,
+.dark,
+body[data-ds-dark-theme] {
+  color-scheme: dark;
+  --bg-canvas: #262624;   --bg-surface: #2F2E2B;   --bg-subtle: #3A3835;
+  --bg-raised: #454340;   --bg-address: #2A2927;   --bg-inverse: #F5F4EF;
+  --text-primary: #F5F4EF;  --text-secondary: #B8B4A8; --text-tertiary: #8A877D;
+  --text-disabled: #6B6963; --text-inverse: #141413;
+  --border-default: #3D3B37;  --border-strong: #4A4843;  --border-focus: #5C5A54;
+  --accent: #E08C6A;      --accent-hover: #F09C7A;   --accent-active: #C97656;
+  --accent-soft: #3D2E27; --accent-text: #EDA987;
+  --blue: #7FA9D4; --green: #93A878; --danger: #D97757; --danger-soft: #43241F;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.30);  --shadow-md: 0 4px 16px rgba(0,0,0,.40);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,.55);
+  --scroll-thumb: #4A4843; --scroll-track: transparent;
+}

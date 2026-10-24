@@ -1,296 +1,568 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
+<!-- 全应用唯一设计源：色板 / 字体栈 / 圆角 / 间距 / 动效曲线都在这个文件里。
+     本文件不定义任何颜色，只引用它的 token；改配色只改 themes/claude.css。 -->
+<link rel="stylesheet" href="themes/claude.css">
 <style>
-/* ===== Claude 主题变量（@property 支持过渡） ===== */
-@property --bg-canvas { syntax: "<color>"; inherits: true; initial-value: #FAF9F5; }
-@property --bg-surface { syntax: "<color>"; inherits: true; initial-value: #FFFFFF; }
-@property --bg-subtle { syntax: "<color>"; inherits: true; initial-value: #F0EEE6; }
-@property --bg-address { syntax: "<color>"; inherits: true; initial-value: #F7F6F2; }
-@property --text-primary { syntax: "<color>"; inherits: true; initial-value: #1F1E1D; }
-@property --text-secondary { syntax: "<color>"; inherits: true; initial-value: #7A7A75; }
-@property --text-tertiary { syntax: "<color>"; inherits: true; initial-value: #9A9890; }
-@property --border-default { syntax: "<color>"; inherits: true; initial-value: #E5E3DA; }
-@property --accent { syntax: "<color>"; inherits: true; initial-value: #C15F3C; }
+/* ============================================================================
+   壳层（顶栏 + 设置面板 + 安全面板）
+   ----------------------------------------------------------------------------
+   约定：
+   1. 取色只走 var(--token)，不写死色值（SVG 图标用 currentColor 继承）。
+   2. 动画只做 transform / opacity（外加颜色类过渡），不动 width/height/top/left。
+   3. 分层靠 1px 暖描边 + --shadow-sm/md 的极淡投影，不用重投影、不用纯白纯黑。
+   4. 曲线与时长一律用 --ease-out / --ease-soft / --dur-*，
+      prefers-reduced-motion 由 themes/claude.css 的全局兜底统一压到 1ms，
+      这里不加 !important、不加循环关键帧，因此不会被绕过。
+   ========================================================================== */
 
-/* ===== 浅色主题 ===== */
-:root, [data-theme="light"] {
-  --bg-canvas: #FAF9F5;
-  --bg-surface: #FFFFFF;
-  --bg-subtle: #F0EEE6;
-  --bg-address: #F7F6F2;
-  --text-primary: #1F1E1D;
-  --text-secondary: #7A7A75;
-  --text-tertiary: #9A9890;
-  --border-default: #E5E3DA;
-  --accent: #C15F3C;
-  --accent-hover: #A94E2E;
-}
+/* 让原生控件（滚动条、输入框光标、表单控件）跟着主题走 —— 不是颜色，只是提示 */
+:root { color-scheme: light; }
+[data-theme="dark"] { color-scheme: dark; }
 
-/* ===== 深色主题 ===== */
-[data-theme="dark"] {
-  --bg-canvas: #262624;
-  --bg-surface: #2F2E2B;
-  --bg-subtle: #3A3835;
-  --bg-address: #2A2927;
-  --text-primary: #F5F4EF;
-  --text-secondary: #B8B4A8;
-  --text-tertiary: #8A877D;
-  --border-default: #3D3B37;
-  --accent: #E08C6A;
-  --accent-hover: #F09C7A;
-}
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
-/* 全局平滑过渡（只作用于根节点） */
-html {
-  transition: --bg-canvas 0.2s ease, --bg-surface 0.2s ease, --bg-subtle 0.2s ease,
-    --bg-address 0.2s ease, --text-primary 0.2s ease, --border-default 0.2s ease, --accent 0.2s ease;
-}
-
-/* ===== 基础样式 ===== */
-* { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  letter-spacing: var(--tracking-tight);
   background: var(--bg-canvas);
+  background-image: var(--wash);
   color: var(--text-primary);
   user-select: none;
   height: 100vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  font-size: 13px;
   position: relative;
+  /* 主题切换时根节点先平滑过渡，下面每个组件再各自过渡自己的底色/描边 */
+  transition: background-color var(--dur-base) var(--ease-out),
+              color var(--dur-base) var(--ease-out);
 }
 
+::selection { background: var(--accent-soft); color: var(--text-primary); }
+
+/* ===== 顶栏 ===== */
+/* 高度必须保持 48px：main.js 的 ADDRESS_BAR_HEIGHT 用它给网页视图让位 */
 .address-bar {
+  position: relative;
   height: 48px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
-  padding: 0 16px;
-  gap: 4px;
+  gap: var(--space-1);
+  padding: 0 var(--space-4);
   background: var(--bg-canvas);
+  border-bottom: 1px solid var(--border-default);
   -webkit-app-region: drag;
-  flex-shrink: 0;
+  transition: background-color var(--dur-base) var(--ease-out),
+              border-color var(--dur-base) var(--ease-out);
 }
 
+/* 纸面颗粒只铺顶栏这一条：45% 概率都看不见，但整页铺会让合成层多出来，
+   滚动区里的元素还会带着伪元素一起滚，收益/代价不划算。 */
+.address-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: var(--grain);
+  pointer-events: none;
+}
+
+/* ----- 工作区下拉 ----- */
 .brand-label {
   -webkit-app-region: no-drag;
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 14px;
-  font-weight: 500;
+  gap: var(--space-2);
+  height: 32px;
+  padding: 0 var(--space-2) 0 var(--space-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
   color: var(--text-primary);
-  padding: 4px 8px 4px 4px;
-  border-radius: 6px;
+  font-size: var(--text-md);
+  font-weight: 500;
   cursor: pointer;
-  margin-right: 8px;
+  margin-right: var(--space-2);
+  flex-shrink: 0;
+  max-width: 220px;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
-.brand-label:hover { background: var(--bg-subtle); }
-.brand-icon { width: 18px; height: 18px; flex-shrink: 0; }
+.brand-label:hover { background: var(--bg-subtle); border-color: var(--border-default); }
+.brand-label:active { background: var(--bg-raised); transform: scale(0.98); }
+.brand-icon { width: 18px; height: 18px; flex-shrink: 0; color: var(--text-secondary);
+  transition: color var(--dur-fast) var(--ease-out); }
+.brand-label:hover .brand-icon { color: var(--accent); }
+#workspace-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chevron { width: 12px; height: 12px; flex-shrink: 0; color: var(--text-tertiary);
+  transition: color var(--dur-base) var(--ease-out), transform var(--dur-base) var(--ease-out); }
+.brand-label:hover .chevron { color: var(--text-secondary); }
 
+/* ----- 前进 / 后退 / 刷新 ----- */
 .nav-btn {
   -webkit-app-region: no-drag;
-  width: 30px;
-  height: 30px;
-  border-radius: 6px;
-  border: none;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
   background: transparent;
+  color: var(--text-secondary);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-secondary);
-  flex-shrink: 0;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out),
+              opacity var(--dur-base) var(--ease-out);
 }
 .nav-btn:hover:not(:disabled) { background: var(--bg-subtle); color: var(--text-primary); }
-.nav-btn:disabled { opacity: 0.35; cursor: default; }
+.nav-btn:active:not(:disabled) { background: var(--bg-raised); transform: scale(0.94); }
+.nav-btn:disabled { opacity: 0.3; cursor: default; }
 
+/* ----- 地址栏 ----- */
 .address-wrap {
   -webkit-app-region: no-drag;
+  position: relative;
   flex: 1;
-  height: 32px;
-  background: var(--bg-address);
-  border-radius: 8px;
+  height: 34px;
+  min-width: 120px;
   display: flex;
   align-items: center;
-  padding: 0 10px;
-  margin: 0 8px;
-  transition: box-shadow 0.15s ease;
+  padding: 0 var(--space-3);
+  margin: 0 var(--space-2);
+  background: var(--bg-address);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  transition: background-color var(--dur-base) var(--ease-out),
+              border-color var(--dur-base) var(--ease-out),
+              box-shadow var(--dur-base) var(--ease-out);
 }
-.address-wrap:focus-within { box-shadow: 0 0 0 2px rgba(193, 95, 60, 0.15); }
+/* 聚焦：描边过渡到 --border-focus，外加一圈极细的强调色外环（不放大、不抖动） */
+.address-wrap:focus-within {
+  background: var(--bg-surface);
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent);
+}
 
-.lock-icon { display: flex; align-items: center; justify-content: center; margin-right: 6px; }
+.lock-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: var(--space-2);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: color var(--dur-base) var(--ease-out), transform var(--dur-fast) var(--ease-out);
+}
+.lock-icon:active { transform: scale(0.92); }
+.lock-icon[data-tone="secure-app"] { color: var(--green); }
+.lock-icon[data-tone="secure-web"] { color: var(--text-tertiary); }
+.lock-icon[data-tone="insecure"] { color: var(--danger); }
+.lock-icon svg { display: block; }
+
 .address-input {
   flex: 1;
+  min-width: 0;
   height: 100%;
   border: none;
   outline: none;
   background: transparent;
-  font-size: 13px;
-  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-primary);
+  caret-color: var(--accent);
+  user-select: text;
+  transition: color var(--dur-base) var(--ease-out);
 }
+.address-input::placeholder { color: var(--text-tertiary); }
 
-/* ===== 设置按钮 ===== */
+/* ----- 设置齿轮 ----- */
 .settings-btn {
   -webkit-app-region: no-drag;
   width: 32px;
   height: 32px;
-  border-radius: 6px;
-  border: none;
+  flex-shrink: 0;
+  margin-left: var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
   background: transparent;
+  color: var(--text-secondary);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-secondary);
-  flex-shrink: 0;
-  margin-left: 8px;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-base) var(--ease-soft);
 }
 .settings-btn:hover { background: var(--bg-subtle); color: var(--text-primary); }
-.settings-btn.active { background: var(--bg-subtle); color: var(--accent); }
+.settings-btn:active { background: var(--bg-raised); }
+/* 展开时图标转过一格（45° 正好是齿轮的对称角，落定后仍是正的）+ 底色与描边标记状态 */
+.settings-btn.active {
+  background: var(--bg-subtle);
+  border-color: var(--border-default);
+  color: var(--accent);
+  transform: rotate(45deg);
+}
+
+/* 键盘可达性：只在 focus-visible 上画外环，鼠标点击不出现 */
+.nav-btn:focus-visible,
+.settings-btn:focus-visible,
+.brand-label:focus-visible,
+.lock-icon:focus-visible,
+.sp-close:focus-visible,
+.theme-seg-item:focus-visible,
+.sp-update-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-canvas),
+              0 0 0 4px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* ===== 浮层通用：轻微上移 + 淡入，只动 opacity / transform ===== */
+.settings-panel {
+  position: absolute;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  color: var(--text-primary);
+  -webkit-app-region: no-drag;
+  visibility: hidden;
+  opacity: 0;
+  transform: translateY(var(--enter-y, -8px));
+  pointer-events: none;
+  transition: opacity var(--dur-base) var(--ease-soft),
+              transform var(--dur-base) var(--ease-soft),
+              visibility 0s linear var(--dur-base),
+              background-color var(--dur-base) var(--ease-out),
+              border-color var(--dur-base) var(--ease-out),
+              box-shadow var(--dur-base) var(--ease-out),
+              color var(--dur-base) var(--ease-out);
+}
+.settings-panel.active {
+  visibility: visible;
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  transition: opacity var(--dur-base) var(--ease-soft),
+              transform var(--dur-base) var(--ease-soft),
+              visibility 0s,
+              background-color var(--dur-base) var(--ease-out),
+              border-color var(--dur-base) var(--ease-out),
+              box-shadow var(--dur-base) var(--ease-out),
+              color var(--dur-base) var(--ease-out);
+}
 
 /* ===== 设置面板 ===== */
 .settings-panel {
-  position: absolute;
-  right: 16px;
-  top: 44px;
-  width: 320px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-default);
-  border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  --enter-y: -8px;
+  top: 56px;
+  right: var(--space-4);
+  width: 340px;
+  max-height: calc(100vh - 68px);
   z-index: 1000000;
-  display: none;
+  display: flex;
   flex-direction: column;
-  overflow: hidden;
-  -webkit-app-region: no-drag;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+  transform-origin: top right;
 }
-.settings-panel.active { display: flex; }
-.settings-panel.panel-up { top: auto; bottom: 44px; }
+.settings-panel.panel-up {
+  --enter-y: 8px;
+  top: auto;
+  bottom: 56px;
+  transform-origin: bottom right;
+}
+
+/* 内容随面板做 ≤96ms 的错峰位移淡入（只有 transform/opacity，关闭时一齐退）。
+   选择器只覆盖面板的直接子项，不是全局通配过渡。 */
+.settings-panel > .sp-header,
+.settings-panel > .sp-section {
+  opacity: 0;
+  transform: translateY(6px);
+  /* 面板可以滚动（内容高于 max-height 时），子项不许被 flex 压缩 */
+  flex-shrink: 0;
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out),
+              background-color var(--dur-base) var(--ease-out),
+              border-color var(--dur-base) var(--ease-out),
+              color var(--dur-base) var(--ease-out);
+}
+.settings-panel.active > .sp-header,
+.settings-panel.active > .sp-section { opacity: 1; transform: none; }
+.settings-panel.active > :nth-child(2) { transition-delay: 24ms; }
+.settings-panel.active > :nth-child(3) { transition-delay: 48ms; }
+.settings-panel.active > :nth-child(4) { transition-delay: 72ms; }
+.settings-panel.active > :nth-child(n + 5) { transition-delay: 96ms; }
 
 .sp-header {
+  flex-shrink: 0;
   height: 48px;
-  padding: 0 16px;
+  padding: 0 var(--space-4);
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--border-default);
 }
-.sp-title { font-size: 16px; font-weight: 500; color: var(--text-primary); }
+/* 面板标题用衬线，取 Claude 那种「有阅读感」的调子；正文仍用 Inter */
+.sp-title {
+  position: relative;
+  padding-bottom: 7px;
+  font-family: var(--font-serif);
+  font-size: var(--text-xl);
+  font-weight: 500;
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-primary);
+  transition: color var(--dur-base) var(--ease-out);
+}
+/* 手绘感下划线：Claude 标题下常有一条不平直的暖色线。用 mask 而不是 background-image，
+   因为 data-URI 里的 SVG 不吃 currentColor，走 mask 才能跟着 --accent 换色。 */
+.sp-title::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 2px;
+  bottom: 0;
+  height: 6px;
+  background-color: var(--accent);
+  opacity: 0.5;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 18' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M2.4 9.2C34 5.4 78 6.2 118 8.4c32 1.8 60 2.2 79.6-.4'/%3E%3Cpath d='M14 14.4c28-3 58-2.4 84-.6' opacity='.5'/%3E%3C/svg%3E") no-repeat center / 100% 100%;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 18' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M2.4 9.2C34 5.4 78 6.2 118 8.4c32 1.8 60 2.2 79.6-.4'/%3E%3Cpath d='M14 14.4c28-3 58-2.4 84-.6' opacity='.5'/%3E%3C/svg%3E") no-repeat center / 100% 100%;
+}
 .sp-close {
-  width: 24px; height: 24px;
-  border-radius: 6px; border: none; background: transparent;
-  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
   color: var(--text-secondary);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
 .sp-close:hover { background: var(--bg-subtle); color: var(--text-primary); }
+.sp-close:active { background: var(--bg-raised); transform: scale(0.92); }
 
-.sp-section { padding: 16px; border-bottom: 1px solid var(--border-default); }
+.sp-section { padding: var(--space-4); border-bottom: 1px solid var(--border-default); }
 .sp-section:last-child { border-bottom: none; }
 .sp-section-label {
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 500;
-  letter-spacing: 1.5px;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-tertiary);
-  margin-bottom: 10px;
+  margin-bottom: var(--space-3);
+  transition: color var(--dur-base) var(--ease-out);
 }
 
+/* ----- 主题分段控件 ----- */
 .theme-seg {
   display: flex;
   gap: 2px;
-  height: 32px;
+  height: 38px;
+  padding: 3px;
   background: var(--bg-subtle);
-  border-radius: 8px;
-  padding: 2px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  transition: background-color var(--dur-base) var(--ease-out),
+              border-color var(--dur-base) var(--ease-out);
 }
 .theme-seg-item {
   flex: 1;
-  border: none;
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   background: transparent;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 400;
   color: var(--text-secondary);
-  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
   font-family: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
 .theme-seg-item:hover { color: var(--text-primary); }
+.theme-seg-item:active { transform: scale(0.97); }
 .theme-seg-item.active {
   background: var(--bg-surface);
+  border-color: var(--border-default);
   color: var(--text-primary);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  font-weight: 500;
+  box-shadow: var(--shadow-sm);
 }
 
+/* ----- 工作区路径 ----- */
 .sp-workspace-path {
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.55;
   color: var(--text-secondary);
-  padding: 6px 10px;
+  padding: var(--space-2) var(--space-3);
   background: var(--bg-subtle);
-  border-radius: 6px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
   word-break: break-all;
-  line-height: 1.5;
+  transition: background-color var(--dur-base) var(--ease-out),
+              border-color var(--dur-base) var(--ease-out),
+              color var(--dur-base) var(--ease-out);
 }
 
-.sp-about-line { font-size: 12px; color: var(--text-secondary); line-height: 1.7; }
+/* ----- 关于 ----- */
+.sp-about-line {
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+  color: var(--text-secondary);
+  transition: color var(--dur-base) var(--ease-out);
+}
+.sp-about-line + .sp-about-line { color: var(--text-tertiary); }
 
-.sp-update-btn {
-  width: 100%;
+/* ----- 设置项按钮与开关 ----- */
+/* 只用既有 token，不引入新色值；过渡仍然只碰颜色与 transform。 */
+.sp-btn-row {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.sp-action-btn {
+  flex: 1;
+  min-width: 0;
   height: 32px;
-  border-radius: 8px;
+  padding: 0 var(--space-2);
   border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+}
+.sp-action-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  border-color: var(--border-focus);
+  color: var(--text-primary);
+}
+.sp-action-btn:active:not(:disabled) { background: var(--bg-raised); transform: scale(0.98); }
+.sp-action-btn:disabled { opacity: 0.55; cursor: default; }
+.sp-action-btn.success {
+  border-color: color-mix(in srgb, var(--green) 55%, var(--border-strong));
+  background: color-mix(in srgb, var(--green) 8%, var(--bg-surface));
+  color: var(--green);
+}
+.sp-diag-btn { width: 100%; margin-top: var(--space-2); }
+.sp-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  font-size: var(--text-sm);
   color: var(--text-primary);
   cursor: pointer;
-  font-size: 13px;
+  transition: color var(--dur-base) var(--ease-out);
+}
+.sp-toggle {
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-raised);
+  cursor: pointer;
+  position: relative;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.sp-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+.sp-toggle:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.sp-toggle:checked::after { transform: translateX(14px); background: #FFFFFF; }
+.sp-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-surface), 0 0 0 4px var(--accent);
+}
+
+/* ----- 检查更新 ----- */
+.sp-update-btn {
+  width: 100%;
+  height: 36px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
   font-family: inherit;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out),
+              opacity var(--dur-base) var(--ease-out);
 }
-.sp-update-btn:hover:not(:disabled) { background: var(--bg-subtle); }
-.sp-update-btn:disabled { opacity: 0.6; cursor: default; }
-.sp-update-btn.success { border-color: var(--accent); color: var(--accent); }
-.sp-update-btn.error { border-color: #B33D3D; color: #B33D3D; }
-
-/* ===== 安全信息面板（保留原有，变量化） ===== */
-.security-panel {
-  position: absolute; top: 40px; left: 0; background: var(--bg-surface);
-  border: 1px solid var(--border-default); border-radius: 12px;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.1); width: 320px; padding: 16px;
-  z-index: 1000; display: none; flex-direction: column; gap: 12px;
-  font-size: 13px; color: var(--text-primary);
+.sp-update-btn:hover:not(:disabled) { background: var(--bg-subtle); border-color: var(--border-focus); }
+.sp-update-btn:active:not(:disabled) { background: var(--bg-raised); transform: scale(0.99); }
+.sp-update-btn:disabled { opacity: 0.55; cursor: default; }
+.sp-update-btn.success {
+  border-color: color-mix(in srgb, var(--green) 55%, var(--border-strong));
+  background: color-mix(in srgb, var(--green) 8%, var(--bg-surface));
+  color: var(--green);
 }
-.security-panel.active { display: flex; }
-.sec-item { display: flex; align-items: center; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--bg-subtle); }
-.sec-item:last-child { border-bottom: none; padding-bottom: 0; }
-.sec-left { display: flex; align-items: center; gap: 8px; }
-.sec-icon { width: 20px; height: 20px; flex-shrink: 0; }
-.sec-icon svg { width: 100%; height: 100%; stroke: #10b981; fill: none; }
-.sec-icon.insecure svg { stroke: #ef4444; }
-.sec-icon.neutral svg { stroke: #6b7280; }
-.sec-icon.bad svg { stroke: #ef4444; }
-.sec-title { font-weight: 600; color: var(--text-primary); }
-.sec-desc { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
-.sec-arrow { color: var(--text-tertiary); font-size: 16px; line-height: 1; }
-.sec-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
-.sec-btn { padding: 4px 12px; background: var(--bg-subtle); border: none; border-radius: 6px; cursor: pointer; font-size: 12px; color: var(--text-secondary); }
+.sp-update-btn.error {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border-strong));
+  background: var(--danger-soft);
+  color: var(--danger);
+}
 
-/* ===== 无障碍：高对比度模式 ===== */
+/* ===== 无障碍：高对比度只做「已有 token 往重的一档映射」，不引入新色值 ===== */
 @media (prefers-contrast: more) {
-  :root { --border-default: #C0BDB2; }
+  .address-bar, .sp-header, .sp-section { border-color: var(--border-strong); }
+  .address-wrap, .theme-seg, .sp-workspace-path, .sp-update-btn { border-color: var(--border-strong); }
+  .sp-section-label { color: var(--text-secondary); }
+  .address-wrap:focus-within { box-shadow: 0 0 0 2px var(--border-strong); }
 }
 </style>
 </head>
 <body>
   <div class="address-bar">
-    <div class="brand-label" id="workspace-btn" title="点击选择项目文件夹">
-      <svg class="brand-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4D6BFE" stroke-width="1.8"><path d="M2 6C2 4.89543 2.89543 4 4 4H9L11 6H20C21.1046 6 22 6.89543 22 8V18C22 19.1046 21.1046 20 20 20H4C2.89543 20 2 19.1046 2 18V6Z"/></svg>
+    <div class="brand-label" id="workspace-btn" role="button" tabindex="0" title="点击选择项目文件夹">
+      <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 6C2 4.89543 2.89543 4 4 4H9L11 6H20C21.1046 6 22 6.89543 22 8V18C22 19.1046 21.1046 20 20 20H4C2.89543 20 2 19.1046 2 18V6Z"/></svg>
       <span id="workspace-text">选择工作区</span>
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4b5563" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
+      <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
     </div>
     <button class="nav-btn" id="btn-back" title="后退" disabled>
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="15 18 9 12 15 6"/></svg>
@@ -301,64 +573,24 @@ body {
     <button class="nav-btn" id="btn-reload" title="刷新">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
     </button>
-    <div class="address-wrap" style="position: relative;">
-      <div class="security-panel" id="security-panel">
-        <div class="sec-item" id="sec-item-main">
-          <div class="sec-left">
-            <div class="sec-icon" id="sec-icon-main">
-              <svg viewBox="0 0 24 24" stroke-width="2.2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-            </div>
-            <div>
-              <div class="sec-title" id="sec-title-text">正在读取连接状态…</div>
-              <div class="sec-desc" id="sec-desc-text"></div>
-            </div>
-          </div>
-        </div>
-        <div class="sec-item">
-          <div class="sec-left">
-            <div class="sec-icon neutral" id="sec-cert-icon"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div>
-            <div>
-              <div class="sec-title" id="sec-cert-title">证书</div>
-              <div class="sec-desc" id="sec-cert-desc"></div>
-            </div>
-          </div>
-        </div>
-        <div class="sec-item">
-          <div class="sec-left">
-            <div class="sec-icon neutral" id="sec-cap-icon"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M12 2l7 4v6c0 5-3 8.5-7 10-4-1.5-7-5-7-10V6l7-4z"/></svg></div>
-            <div>
-              <div class="sec-title" id="sec-cap-title">本应用能力</div>
-              <div class="sec-desc" id="sec-cap-desc"></div>
-            </div>
-          </div>
-        </div>
-        <div class="sec-item">
-          <div class="sec-left">
-            <div class="sec-icon neutral"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M4 7v10c0 2 1.5 3 3 3h10c1.5 0 3-1 3-3V7c0-2-1.5-3-3-3H7c-1.5 0-3 1-3 3z"/><path d="M9 3v18M15 3v18M4 12h16"/></svg></div>
-            <div>
-              <div class="sec-title">Cookie 和网站数据</div>
-              <div class="sec-desc" id="sec-cookie-desc">网站会使用 Cookie 和其他数据来记住您。</div>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="lock-icon" id="lock-btn" style="cursor: pointer;">
-        <svg id="lock-svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.2">
+    <div class="address-wrap">
+      <div class="lock-icon" id="lock-btn" role="button" tabindex="0" aria-expanded="false" data-tone="secure-web" title="连接状态">
+        <svg id="lock-svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
           <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
           <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
         </svg>
       </div>
-      <input class="address-input" id="address-input" type="text" value="https://chat.deepseek.com/">
+      <input class="address-input" id="address-input" type="text" spellcheck="false" placeholder="搜索或输入网址" value="https://chat.deepseek.com/">
     </div>
+    <button class="settings-btn" id="settings-btn" title="设置" aria-haspopup="dialog" aria-expanded="false">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      </svg>
+    </button>
   </div>
-  <button class="settings-btn" id="settings-btn" title="设置">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-      <circle cx="12" cy="12" r="3"/>
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-    </svg>
-  </button>
 
-  <div class="settings-panel" id="settings-panel">
+  <div class="settings-panel" id="settings-panel" role="dialog" aria-label="设置">
     <div class="sp-header">
       <span class="sp-title">设置</span>
       <button class="sp-close" id="sp-close" title="关闭">
@@ -368,7 +600,7 @@ body {
 
     <div class="sp-section">
       <div class="sp-section-label">外观</div>
-      <div class="theme-seg" id="theme-seg">
+      <div class="theme-seg" id="theme-seg" role="group" aria-label="主题">
         <button class="theme-seg-item" data-theme-value="system">跟随系统</button>
         <button class="theme-seg-item" data-theme-value="light">浅色</button>
         <button class="theme-seg-item" data-theme-value="dark">深色</button>
@@ -378,16 +610,33 @@ body {
     <div class="sp-section">
       <div class="sp-section-label">工作区</div>
       <div class="sp-workspace-path" id="sp-workspace">加载中...</div>
+      <div class="sp-btn-row">
+        <button class="sp-action-btn" id="sp-ws-change">更改…</button>
+        <button class="sp-action-btn" id="sp-ws-open">打开文件夹</button>
+      </div>
+    </div>
+
+    <div class="sp-section">
+      <div class="sp-section-label">通用</div>
+      <label class="sp-toggle-row">
+        <span>开机时自动启动</span>
+        <input type="checkbox" class="sp-toggle" id="sp-login" role="switch">
+      </label>
+      <div class="sp-btn-row">
+        <button class="sp-action-btn" id="sp-reload">重新加载页面</button>
+        <button class="sp-action-btn" id="sp-clear-cache">清除缓存</button>
+      </div>
     </div>
 
     <div class="sp-section">
       <div class="sp-section-label">关于</div>
-      <div class="sp-about-line">DeepSeek 桌面客户端 v1.0.0</div>
+      <div class="sp-about-line" id="sp-app-ver">DeepSeek 桌面客户端 v—</div>
       <div class="sp-about-line" id="sp-electron-ver">Electron —</div>
     </div>
 
     <div class="sp-section">
       <button class="sp-update-btn" id="sp-update-btn">检查更新</button>
+      <button class="sp-action-btn sp-diag-btn" id="sp-diag">复制诊断信息</button>
     </div>
   </div>
 
@@ -404,20 +653,55 @@ body {
     btnForward.onclick = () => { isUserEditing = false; window.shellAPI.forward(); };
     btnReload.onclick = () => { isUserEditing = false; window.shellAPI.reload(); };
 
-    // 安全面板逻辑
+    // 连接信息浮层：它不在壳层 DOM 里，而是主进程单独开的一个 WebContentsView。
+    // 壳层只发「开关 + 锁图标坐标」，网页几何完全不动 —— 这就是它不再挤开页面的原因。
     const lockBtn = document.getElementById("lock-btn");
-    const secPanel = document.getElementById("security-panel");
-    
+    let securityPanelOpen = false;
+
+    window.shellAPI.onSecurityPanelState((open) => {
+      securityPanelOpen = !!open;
+      lockBtn.setAttribute("aria-expanded", securityPanelOpen ? "true" : "false");
+    });
+
+    function toggleSecurityPanel() {
+      if (securityPanelOpen) {
+        window.shellAPI.closeSecurityPanel();
+        return;
+      }
+      const r = lockBtn.getBoundingClientRect();
+      window.shellAPI.toggleSecurityPanel(r.left);
+    }
+
     lockBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      secPanel.classList.toggle("active");
+      toggleSecurityPanel();
+    });
+    lockBtn.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleSecurityPanel();
+      }
     });
 
     document.addEventListener("click", () => {
-      secPanel.classList.remove("active");
+      if (securityPanelOpen) window.shellAPI.closeSecurityPanel();
     });
-    secPanel.addEventListener("click", (e) => e.stopPropagation());
 
+    // 设置面板仍然长在壳层 DOM 里，aiView 会把它整块遮住，所以它保留「申请让位」。
+    // 让位只影响设置面板，安全浮层已经不再走这条路径。
+    let insetKey = null;
+    function insetFor(side, width) {
+      const key = side ? side + ":" + width : "none";
+      if (key === insetKey) return;
+      insetKey = key;
+      window.shellAPI.setPanelInset(side || "none", side ? width : 0);
+    }
+    function insetForPanel(open, el, side) {
+      if (!open) { insetFor(null, 0); return; }
+      const r = el.getBoundingClientRect();
+      insetFor(side, Math.ceil(side === "left" ? r.right : window.innerWidth - r.left));
+    }
 
     inputEl.addEventListener("keydown", async (e) => {
       isUserEditing = true;
@@ -437,6 +721,9 @@ body {
     workspaceBtn.onclick = async () => {
       try { await window.shellAPI.selectWorkspace(); updateWorkspace(); } catch (e) {}
     };
+    workspaceBtn.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); workspaceBtn.click(); }
+    });
 
     async function updateWorkspace() {
       try {
@@ -467,71 +754,21 @@ body {
       "secure-web": '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
       "insecure":   '<path d="M12 3L2 20h20L12 3z"/><line x1="12" y1="10" x2="12" y2="14"/><line x1="12" y1="17" x2="12.01" y2="17"/>'
     };
-    const LOCK_COLORS = { "secure-app": "#10b981", "secure-web": "#6b7280", "insecure": "#ef4444" };
-    const SEC_TITLES = {
+    // 颜色一律交给 CSS（.lock-icon[data-tone] 用 --green / --text-tertiary / --danger），
+    // 这里只留语义档位，避免在壳层里出现第二套色值。
+    const LOCK_TITLES = {
       "secure-app": "已连接到 DeepSeek 官方站点",
       "secure-web": "第三方站点，连接已加密",
       "insecure": "连接未加密，请勿输入敏感信息"
     };
-
-    function setText(id, v) {
-      const el = document.getElementById(id);
-      if (el) el.textContent = v;
-    }
-    function setIconTone(id, tone) {
-      const el = document.getElementById(id);
-      if (!el) return;
-      el.classList.remove("neutral", "bad", "insecure");
-      el.classList.add(tone);
-    }
-
-    // 全部字段都来自主进程的真实状态：证书那一行以前是写死在 HTML 里的
-    // 「证书有效」，任何站点都显示同一句，属于假信息。
+    // 面板内容已经搬进 security.html（独立视图），锁图标这里只保留三态外观。
     function renderSecurity(state) {
       if (!state) return;
       const level = state.level || (state.https ? "secure-web" : "insecure");
 
       lockEl.innerHTML = LOCK_ICONS[level] || LOCK_ICONS["secure-web"];
-      lockEl.setAttribute("stroke", LOCK_COLORS[level] || "#6b7280");
-      lockBtn.setAttribute("title", SEC_TITLES[level] || "");
-
-      const iconWrap = document.getElementById("sec-icon-main");
-      if (iconWrap) {
-        iconWrap.classList.remove("insecure");
-        if (level === "insecure") iconWrap.classList.add("insecure");
-      }
-      setText("sec-title-text", SEC_TITLES[level] || "");
-      setText("sec-desc-text", state.host ? ("站点：" + state.host) : "");
-
-      if (state.certError) {
-        setIconTone("sec-cert-icon", "bad");
-        setText("sec-cert-title", "证书校验失败");
-        setText("sec-cert-desc", state.certError.error +
-          (state.certError.issuer ? ("；颁发者：" + state.certError.issuer) : ""));
-      } else if (state.https) {
-        setIconTone("sec-cert-icon", "neutral");
-        setText("sec-cert-title", "本次连接无证书错误");
-        setText("sec-cert-desc", "未收到证书错误事件；本应用不做证书链深度校验。");
-      } else {
-        setIconTone("sec-cert-icon", "bad");
-        setText("sec-cert-title", "此连接未加密");
-        setText("sec-cert-desc", "HTTP 明文传输，路径上的任何一方都能读取或篡改内容。");
-      }
-
-      const enabled = state.capability === "enabled";
-      setIconTone("sec-cap-icon", enabled ? "neutral" : "bad");
-      if (enabled) {
-        setText("sec-cap-title", "代码执行与文件读写：已启用");
-        setText("sec-cap-desc", state.workspace
-          ? ("工作区：" + state.workspace + "（读写仅限该目录内）")
-          : "尚未选择工作区 —— 请点击左上角文件夹图标选择目录。");
-      } else if (state.capability === "disabled-third-party") {
-        setText("sec-cap-title", "代码执行与文件读写：已关闭");
-        setText("sec-cap-desc", "此处仅作浏览。注入与本地执行只在 DeepSeek 官方站点启用。");
-      } else {
-        setText("sec-cap-title", "代码执行与文件读写：已关闭");
-        setText("sec-cap-desc", "连接未加密，本地能力已全部禁用。");
-      }
+      lockBtn.dataset.tone = level in LOCK_ICONS ? level : "secure-web";
+      lockBtn.setAttribute("title", LOCK_TITLES[level] || "");
     }
 
 
@@ -568,24 +805,28 @@ body {
       const spElectronVer = document.getElementById("sp-electron-ver");
       const spUpdateBtn = document.getElementById("sp-update-btn");
 
+      // 面板常驻布局（visibility 而非 display 控制显隐），
+      // 所以 offsetHeight 随时可量，不用再玩「先 hidden 再测量」那一套。
       function togglePanel() {
-        const isOpen = settingsPanel.classList.contains("active");
-        if (isOpen) { closePanel(); return; }
+        if (settingsPanel.classList.contains("active")) { closePanel(); return; }
         const btnRect = settingsBtn.getBoundingClientRect();
-        settingsPanel.style.visibility = "hidden";
-        settingsPanel.classList.add("active");
-        const panelH = settingsPanel.offsetHeight;
-        settingsPanel.classList.remove("active");
-        settingsPanel.style.visibility = "";
         const spaceBelow = window.innerHeight - btnRect.bottom - 12;
-        settingsPanel.classList.toggle("panel-up", spaceBelow < panelH);
+        settingsPanel.classList.toggle("panel-up", spaceBelow < settingsPanel.offsetHeight);
+        openPanel();
+      }
+
+      function openPanel() {
         settingsPanel.classList.add("active");
         settingsBtn.classList.add("active");
+        settingsBtn.setAttribute("aria-expanded", "true");
+        insetForPanel(true, settingsPanel, "right");
       }
 
       function closePanel() {
         settingsPanel.classList.remove("active");
         settingsBtn.classList.remove("active");
+        settingsBtn.setAttribute("aria-expanded", "false");
+        insetForPanel(false, settingsPanel, "right");
       }
 
       settingsBtn.addEventListener("click", function(e) {
@@ -600,14 +841,18 @@ body {
       settingsPanel.addEventListener("click", function(e) { e.stopPropagation(); });
 
       document.addEventListener("keydown", function(e) {
-        if (e.key === "Escape" && settingsPanel.classList.contains("active")) closePanel();
+        if (e.key !== "Escape") return;
+        if (settingsPanel.classList.contains("active")) closePanel();
+        if (securityPanelOpen) window.shellAPI.closeSecurityPanel();
       });
 
       let currentTheme = "system";
 
       function updateSegUI() {
         themeSeg.querySelectorAll(".theme-seg-item").forEach(function(el) {
-          el.classList.toggle("active", el.dataset.themeValue === currentTheme);
+          const on = el.dataset.themeValue === currentTheme;
+          el.classList.toggle("active", on);
+          el.setAttribute("aria-pressed", on ? "true" : "false");
         });
       }
 
@@ -621,6 +866,8 @@ body {
         try { await window.shellAPI.setTheme(theme); } catch (err) {}
       });
 
+      // 主题切换的平滑过渡由各自的 color / background-color 过渡完成，
+      // 色值全部来自 themes/claude.css 的 token，本文件不参与配色。
       window.shellAPI.onThemeChange(function(data) {
         currentTheme = data.theme;
         document.documentElement.dataset.theme = data.resolved;
@@ -636,15 +883,113 @@ body {
         } catch (e) {}
       })();
 
-      // 打开面板时刷新工作区信息
+      // 打开面板时刷新工作区信息，并关掉另一个浮层（两者叠在一起会挡视线）
       settingsBtn.addEventListener("click", async function() {
+        if (securityPanelOpen) window.shellAPI.closeSecurityPanel();
+        await refreshWorkspacePath();
+        try {
+          const res = await window.shellAPI.getLoginItem();
+          spLogin.checked = !!(res && res.openAtLogin);
+        } catch (e) {}
+      });
+
+      // 版本号以前是 HTML 里写死的 v1.0.0：装着 1.6.x 也显示 1.0.0，属于假信息。
+      // 现在一律来自主进程的 app.getVersion()。
+      const spAppVer = document.getElementById("sp-app-ver");
+      const spLogin = document.getElementById("sp-login");
+      const spWsChange = document.getElementById("sp-ws-change");
+      const spWsOpen = document.getElementById("sp-ws-open");
+      const spReload = document.getElementById("sp-reload");
+      const spClearCache = document.getElementById("sp-clear-cache");
+      const spDiag = document.getElementById("sp-diag");
+
+      async function refreshWorkspacePath() {
         try {
           const ws = await window.shellAPI.getWorkspace();
           spWorkspace.textContent = ws && ws.path ? ws.path : "未选择";
-        } catch (e) { spWorkspace.textContent = "未选择"; }
+          return ws && ws.path ? ws.path : "";
+        } catch (e) {
+          spWorkspace.textContent = "未选择";
+          return "";
+        }
+      }
+
+      (async function initAbout() {
+        spElectronVer.textContent = "Electron " + (window.shellAPI.electronVersion || "—");
+        try {
+          const info = await window.shellAPI.getAppInfo();
+          if (info && info.version) spAppVer.textContent = "DeepSeek 桌面客户端 v" + info.version;
+        } catch (e) {}
+      })();
+
+      (async function initLoginItem() {
+        try {
+          const res = await window.shellAPI.getLoginItem();
+          spLogin.checked = !!(res && res.openAtLogin);
+        } catch (e) {}
+      })();
+
+      spLogin.addEventListener("change", async function() {
+        spLogin.disabled = true;
+        try {
+          const res = await window.shellAPI.setLoginItem(spLogin.checked);
+          if (!res || !res.ok) spLogin.checked = !spLogin.checked;
+        } catch (e) {
+          spLogin.checked = !spLogin.checked;
+        }
+        spLogin.disabled = false;
       });
 
-      spElectronVer.textContent = "Electron " + (window.shellAPI.electronVersion || "—");
+      spWsChange.addEventListener("click", async function() {
+        try {
+          await window.shellAPI.selectWorkspace();
+          await refreshWorkspacePath();
+        } catch (e) {}
+      });
+
+      spWsOpen.addEventListener("click", async function() {
+        const p = await refreshWorkspacePath();
+        if (!p) return;
+        const res = await window.shellAPI.openWorkspaceFolder();
+        if (!res || !res.ok) alert("无法打开文件夹：" + ((res && res.error) || "未知错误"));
+      });
+
+      spReload.addEventListener("click", function() { window.shellAPI.reload(); });
+
+      spClearCache.addEventListener("click", async function() {
+        spClearCache.disabled = true;
+        const old = spClearCache.textContent;
+        spClearCache.textContent = "清除中…";
+        try {
+          const res = await window.shellAPI.clearCache();
+          spClearCache.textContent = res && res.ok ? "已清除" : "清除失败";
+        } catch (e) {
+          spClearCache.textContent = "清除失败";
+        }
+        setTimeout(function() {
+          spClearCache.textContent = old;
+          spClearCache.disabled = false;
+        }, 1600);
+      });
+
+      spDiag.addEventListener("click", async function() {
+        const text = [
+          spAppVer.textContent || "",
+          "Electron " + (window.shellAPI.electronVersion || "—"),
+          "主题 " + currentTheme + "（" + (document.documentElement.dataset.theme || "") + "）",
+          "工作区 " + (spWorkspace.textContent || "")
+        ].join("\n");
+        try {
+          await navigator.clipboard.writeText(text);
+          const old = spDiag.textContent;
+          spDiag.classList.add("success");
+          spDiag.textContent = "已复制";
+          setTimeout(function() {
+            spDiag.textContent = old;
+            spDiag.classList.remove("success");
+          }, 1400);
+        } catch (e) {}
+      });
 
       let updateLocked = false;
       spUpdateBtn.addEventListener("click", async function() {

@@ -1,11 +1,11 @@
 {
   "name": "deepseek-desktop",
-  "version": "1.4.0",
+  "version": "1.6.10",
   "description": "DeepSeek 桌面客户端",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node test/security.test.js && node test/runner.test.js && node test/preload-guard.test.js && node test/shell-security.test.js",
+    "test": "node test/security.test.js && node test/runner.test.js && node test/preload-guard.test.js && node test/shell-security.test.js && node test/theme.test.js",
     "build": "npm test && electron-builder --win --x64"
   },
   "author": "guihuo125",
@@ -42,6 +42,9 @@
       "dialog-preload.js",
       "shell.html",
       "shell-preload.js",
+      "security.html",
+      "security-preload.js",
+      "themes/**/*",
       "assets/**/*",
       "!assets/*.png",
       "!assets/*.ico.bak"

@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<title>连接安全信息</title>
+<link rel="stylesheet" href="themes/claude.css">
+<style>
+  /* 这个文档住在独立的 WebContentsView 里，只占地址栏下方一小块矩形。
+     它不参与主页面布局，所以打开它不会改变网页宽度 —— 这正是它存在的原因。
+     view 比卡片四周多留 16px，用来容纳阴影，否则阴影会被 view 边界裁掉。 */
+  html, body { margin: 0; background: transparent; }
+  body {
+    padding: 16px;
+    width: 330px;
+    box-sizing: border-box;
+    font-family: var(--font-ui);
+    color: var(--text-primary);
+    overflow: hidden;
+    cursor: default;
+    user-select: none;
+  }
+  .sec-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-2);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg);
+    opacity: 0;
+    transform: translateY(-6px);
+    transition: opacity var(--dur-base) var(--ease-soft),
+                transform var(--dur-base) var(--ease-soft),
+                background-color var(--dur-base) var(--ease-out),
+                border-color var(--dur-base) var(--ease-out);
+  }
+  body.open .sec-panel { opacity: 1; transform: none; }
+
+  .sec-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-md);
+    transition: background-color var(--dur-fast) var(--ease-out);
+  }
+  .sec-item:hover { background: var(--bg-subtle); }
+  .sec-left { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+  .sec-icon {
+    width: 28px; height: 28px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-sm);
+    background: var(--bg-subtle);
+    color: var(--green);
+  }
+  .sec-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; }
+  .sec-icon.good { color: var(--green); }
+  .sec-icon.neutral { color: var(--text-tertiary); }
+  .sec-icon.bad,
+  .sec-icon.insecure { color: var(--danger); background: var(--danger-soft); }
+  .sec-title {
+    font-size: var(--text-md);
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+  .sec-desc {
+    font-size: var(--text-xs);
+    line-height: var(--leading-body);
+    color: var(--text-secondary);
+    margin-top: 2px;
+    word-break: break-word;
+  }
+
+  @media (prefers-contrast: more) {
+    .sec-icon { background: var(--bg-raised); }
+    .sec-desc { color: var(--text-secondary); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sec-panel { transition-duration: 1ms; }
+    .sec-item { transition-duration: 1ms; }
+  }
+</style>
+</head>
+<body>
+  <div class="sec-panel" role="dialog" aria-label="连接安全信息">
+    <div class="sec-item">
+      <div class="sec-left">
+        <div class="sec-icon" id="i-main">
+          <svg viewBox="0 0 24 24" stroke-width="2.2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        </div>
+        <div>
+          <div class="sec-title" id="t-main">连接状态</div>
+          <div class="sec-desc" id="d-main"></div>
+        </div>
+      </div>
+    </div>
+    <div class="sec-item">
+      <div class="sec-left">
+        <div class="sec-icon neutral" id="i-cert">
+          <svg viewBox="0 0 24 24" stroke-width="2"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </div>
+        <div>
+          <div class="sec-title" id="t-cert">证书</div>
+          <div class="sec-desc" id="d-cert"></div>
+        </div>
+      </div>
+    </div>
+    <div class="sec-item">
+      <div class="sec-left">
+        <div class="sec-icon neutral" id="i-cap">
+          <svg viewBox="0 0 24 24" stroke-width="2"><path d="M12 2l7 4v6c0 5-3 8.5-7 10-4-1.5-7-5-7-10V6l7-4z"/></svg>
+        </div>
+        <div>
+          <div class="sec-title" id="t-cap">本应用能力</div>
+          <div class="sec-desc" id="d-cap"></div>
+        </div>
+      </div>
+    </div>
+    <div class="sec-item">
+      <div class="sec-left">
+        <div class="sec-icon neutral">
+          <svg viewBox="0 0 24 24" stroke-width="2"><path d="M4 7v10c0 2 1.5 3 3 3h10c1.5 0 3-1 3-3V7c0-2-1.5-3-3-3H7c-1.5 0-3 1-3 3z"/><path d="M9 3v18M15 3v18M4 12h16"/></svg>
+        </div>
+        <div>
+          <div class="sec-title">Cookie 和网站数据</div>
+          <div class="sec-desc">网站会使用 Cookie 和其他数据来记住您。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+<script>
+  var LOCK_TITLES = {
+    "secure-app": "已连接到 DeepSeek 官方站点",
+    "secure-web": "第三方站点，连接已加密",
+    "insecure": "连接未加密，请勿输入敏感信息"
+  };
+  var SEC_TONES = { "secure-app": "good", "secure-web": "neutral", "insecure": "insecure" };
+
+  function el(id) { return document.getElementById(id); }
+  function setIconTone(id, tone) {
+    var node = el(id);
+    if (!node) return;
+    node.classList.remove("neutral", "bad", "insecure", "good");
+    node.classList.add(tone);
+  }
+
+  function render(state) {
+    if (!state) return;
+    var level = state.level || (state.https ? "secure-web" : "insecure");
+    setIconTone("i-main", SEC_TONES[level] || "neutral");
+    el("t-main").textContent = LOCK_TITLES[level] || "";
+    el("d-main").textContent = state.host ? ("站点：" + state.host) : "";
+
+    if (state.certError) {
+      setIconTone("i-cert", "bad");
+      el("t-cert").textContent = "证书校验失败";
+      el("d-cert").textContent = state.certError.error +
+        (state.certError.issuer ? ("；颁发者：" + state.certError.issuer) : "");
+    } else if (state.https) {
+      setIconTone("i-cert", "neutral");
+      el("t-cert").textContent = "本次连接无证书错误";
+      el("d-cert").textContent = "未收到证书错误事件；本应用不做证书链深度校验。";
+    } else {
+      setIconTone("i-cert", "bad");
+      el("t-cert").textContent = "此连接未加密";
+      el("d-cert").textContent = "HTTP 明文传输，路径上的任何一方都能读取或篡改内容。";
+    }
+
+    var enabled = state.capability === "enabled";
+    setIconTone("i-cap", enabled ? "good" : "bad");
+    if (enabled) {
+      el("t-cap").textContent = "代码执行与文件读写：已启用";
+      el("d-cap").textContent = state.workspace
+        ? ("工作区：" + state.workspace + "（读写仅限该目录内）")
+        : "尚未选择工作区 —— 请点击左上角文件夹图标选择目录。";
+    } else if (state.capability === "disabled-third-party") {
+      el("t-cap").textContent = "代码执行与文件读写：已关闭";
+      el("d-cap").textContent = "此处仅作浏览。注入与本地执行只在 DeepSeek 官方站点启用。";
+    } else {
+      el("t-cap").textContent = "代码执行与文件读写：已关闭";
+      el("d-cap").textContent = "连接未加密，本地能力已全部禁用。";
+    }
+  }
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") window.secAPI.close();
+  });
+  window.secAPI.onTheme(function (data) {
+    document.documentElement.dataset.theme = data.resolved;
+  });
+  window.secAPI.onState(render);
+  window.secAPI.onOpen(function () {
+    document.body.classList.remove("open");
+    // 强制一帧，让淡入动画每次打开都重新播
+    void document.body.offsetWidth;
+    document.body.classList.add("open");
+  });
+  window.secAPI.getTheme().then(function (data) {
+    document.documentElement.dataset.theme = data.resolved;
+  }).catch(function () {});
+</script>
+</body>
+</html>
