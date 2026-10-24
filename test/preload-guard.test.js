@@ -19,71 +19,121 @@ function ok(cond, msg) {
   else { failed++; console.log("  ✗ " + msg); }
 }
 
-// 用给定的 hostname 跑 preload，返回它是否调用了 exposeInMainWorld
-function runWithHost(hostname) {
-  let exposed = false;
+// 用给定的 protocol + hostname 跑 preload，记录所有对外副作用
+function runWith(proto, hostname) {
+  const exposed = [];        // [{ name, keys }]
+  let ipcOnCalls = 0;
+  let observers = 0;
+
+  const fakeIpcRenderer = {
+    on: () => { ipcOnCalls++; },
+    invoke: () => Promise.resolve({}),
+    send: () => {}
+  };
   const fakeRequire = (id) => {
     if (id === "electron") {
       return {
-        contextBridge: { exposeInMainWorld: () => { exposed = true; } },
-        ipcRenderer: { on: () => {}, invoke: () => Promise.resolve({}), send: () => {} }
+        contextBridge: {
+          exposeInMainWorld: (name, api) => {
+            exposed.push({ name, keys: Object.keys(api || {}) });
+          }
+        },
+        ipcRenderer: fakeIpcRenderer
       };
     }
-    if (id === "./package.json") return { version: "1.1.0" };
+    if (id === "./package.json") return { version: "9.9.9" };
     return {};
   };
+
+  const stubEl = () => ({
+    style: {}, dataset: {}, classList: { add() {}, remove() {}, contains: () => false },
+    setAttribute() {}, getAttribute: () => null, removeAttribute() {},
+    appendChild() {}, addEventListener() {}, remove() {}, querySelector: () => null,
+    querySelectorAll: () => [], closest: () => null, contains: () => false
+  });
   const sandbox = {
     require: fakeRequire,
     console: { log() {}, warn() {}, error() {} },
-    location: { hostname, origin: "https://" + hostname, href: "https://" + hostname + "/" },
+    location: { protocol: proto, hostname, origin: proto + "//" + hostname, href: proto + "//" + hostname + "/" },
     setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
-    // 门控放行后 init() 会碰 DOM；给最少的桩让「是否暴露桥」这个判断先完成
+    requestAnimationFrame: () => 0, cancelAnimationFrame: () => {},
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     document: {
-      addEventListener: () => {}, readyState: "complete",
+      addEventListener() {}, removeEventListener() {}, readyState: "complete",
       getElementById: () => null, querySelector: () => null, querySelectorAll: () => [],
-      createElement: () => ({ style: {}, setAttribute() {}, appendChild() {}, addEventListener() {}, classList: { add() {}, remove() {} }, dataset: {} }),
-      body: null, documentElement: { dataset: {}, style: {} }
+      createElement: stubEl, createTextNode: () => ({}), body: null,
+      documentElement: { dataset: {}, style: {} }
     },
-    MutationObserver: function () { this.observe = () => {}; this.disconnect = () => {}; },
+    MutationObserver: function () {
+      observers++;
+      this.observe = () => {}; this.disconnect = () => {};
+    },
     WeakSet, Set, Map, JSON, Math, Date, Buffer, Promise, String, Number, Object, Array, RegExp, Error,
-    process: { platform: "win32", versions: {} }
+    process: { platform: "win32", versions: {}, env: {} }
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
 
   const wrapped = "(function (exports, require, module, __filename, __dirname) {\n" + SRC + "\n})";
-  let fn;
+  let fn = null, error = null;
   try {
     fn = vm.runInNewContext(wrapped, sandbox, { filename: "preload.js" });
   } catch (e) {
-    return { exposed, error: "包装失败: " + e.message };
+    return { exposed, ipcOnCalls, observers, error: "包装失败: " + e.message };
   }
   try {
     fn.call(sandbox, {}, fakeRequire, { exports: {} }, "preload.js", ".");
   } catch (e) {
-    // 门控之后的 DOM 桩不完整会抛错，那是预期的；我们只关心 expose 有没有发生
-    return { exposed, error: e.message };
+    error = e.message;   // 门控放行后 DOM 桩不完整会抛错，属预期
   }
-  return { exposed };
+  return { exposed, ipcOnCalls, observers, error };
 }
 
-console.log("\n== 非 DeepSeek 站点：必须完全不注入 ==");
-for (const host of ["www.bing.com", "bing.com", "evil.example.net", "localhost",
-                    "deepseek.com.evil.net", "chat.deepseek.com.evil.io"]) {
-  const r = runWithHost(host);
-  ok(r.exposed === false, `未暴露桥接对象: ${host}` + (r.error ? `（后续抛错属预期: ${r.error.slice(0, 40)}）` : ""));
+const BAD_HOSTS = [
+  // 常规第三方
+  "www.bing.com", "bing.com", "evil.example.net", "localhost", "127.0.0.1",
+  // 后缀伪造：抓 endsWith("deepseek.com") 这种丢掉点号的退化
+  "deepseek.com.evil.net", "chat.deepseek.com.evil.io",
+  "evildeepseek.com", "fakedeepseek.com", "not-deepseek.com", "deepseek.comx.io"
+];
+
+console.log("\n== 非 DeepSeek 域名：必须零副作用 ==");
+for (const host of BAD_HOSTS) {
+  const r = runWith("https:", host);
+  // 不只是"没暴露桥"，还要没注册监听、没建 observer、没在门控之后抛错
+  ok(r.exposed.length === 0 && r.ipcOnCalls === 0 && r.observers === 0 && r.error === null,
+     `零注入: ${host}` + (r.error ? `（意外抛错: ${r.error.slice(0, 50)}）` : ""));
 }
 
-console.log("\n== DeepSeek 官方域名：正常放行 ==");
+console.log("\n== 明文 http 的 DeepSeek 站点：也必须关闭 ==");
+// 主进程放开地址栏后 http://chat.deepseek.com 也能加载；明文连接上的中间人
+// 可以直接往页面塞代码块来触发本地执行，所以协议必须是 https
+for (const host of ["chat.deepseek.com", "deepseek.com"]) {
+  const r = runWith("http:", host);
+  ok(r.exposed.length === 0 && r.ipcOnCalls === 0 && r.observers === 0 && r.error === null,
+     `零注入（http 明文）: ${host}`);
+}
+
+console.log("\n== https 的 DeepSeek 官方域名：正常放行 ==");
 for (const host of ["deepseek.com", "chat.deepseek.com", "www.deepseek.com"]) {
-  const r = runWithHost(host);
-  ok(r.exposed === true, `已暴露桥接对象: ${host}`);
+  const r = runWith("https:", host);
+  ok(r.exposed.length === 1 && r.exposed[0].name === "deepseekDesktop", `已暴露桥接对象: ${host}`);
 }
 
-console.log("\n== 空/异常 hostname：按不可信处理 ==");
+console.log("\n== 暴露内容不得扩权 ==");
+// 桥面上只允许 version / platform。加任何新键都等于把能力交给远程页面，
+// 必须显式改这条断言并说明理由，不能顺手塞。
 {
-  const sandboxEmpty = runWithHost("");
-  ok(sandboxEmpty.exposed === false, "空 hostname 不注入");
+  const r = runWith("https:", "chat.deepseek.com");
+  const keys = (r.exposed[0] && r.exposed[0].keys || []).slice().sort();
+  ok(JSON.stringify(keys) === JSON.stringify(["platform", "version"]),
+     "桥面键集合仍只有 platform/version，实际: " + JSON.stringify(keys));
+}
+
+console.log("\n== 空 / 异常来源：按不可信处理 ==");
+for (const h of ["", "undefined"]) {
+  const r = runWith("https:", h);
+  ok(r.exposed.length === 0 && r.ipcOnCalls === 0, `不注入: hostname="${h}"`);
 }
 
 console.log("\n==================================================");

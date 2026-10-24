@@ -1,6 +1,6 @@
 const {
   app, BrowserWindow, WebContentsView, Tray, Menu, globalShortcut, Notification,
-  shell, dialog, safeStorage, nativeTheme, screen, ipcMain, utilityProcess
+  shell, dialog, safeStorage, nativeTheme, screen, ipcMain, utilityProcess, session
 } = require("electron");
 const fs = require("fs");
 const https = require("https");
@@ -67,6 +67,34 @@ function isTrustedUrl(url) {
   }
 }
 
+// ============ 权限收口 ============
+// 地址栏能打开任意站点之后这条必须有：Electron 的默认行为是对 media /
+// geolocation / notifications 等请求弹系统授权框，任何被浏览到的站点都能借机
+// 索取摄像头、麦克风、定位。这里默认全拒，只给 DeepSeek 开 notifications
+//（它确实要用通知提示回复完成），媒体设备/剪贴板/定位/MIDI 连 DeepSeek 也不给。
+function hardenPermissions(ses) {
+  const isDeepSeekOrigin = (origin) => {
+    try { return isTrustedUrl(String(origin)); } catch (e) { return false; }
+  };
+  const granted = (permission, origin) =>
+    permission === "notifications" && isDeepSeekOrigin(origin);
+
+  ses.setPermissionRequestHandler((wc, permission, callback, details) => {
+    let origin = (details && details.requestingOrigin) || "";
+    if (!origin && wc && !wc.isDestroyed()) origin = wc.getURL();
+    const ok = granted(permission, origin);
+    if (!ok) console.warn("[Security] 已拒绝权限:", permission, String(origin).substring(0, 120));
+    callback(ok);
+  });
+
+  // 同步检查接口（navigator.permissions.query 之类）也要拦，否则只挡弹窗没用
+  ses.setPermissionCheckHandler((wc, permission, origin) => {
+    let o = origin || "";
+    if (!o && wc && !wc.isDestroyed()) o = wc.getURL();
+    return granted(permission, o);
+  });
+}
+
 // ============ IPC 来源校验 ============
 // preload 通过 contextBridge 暴露给远程页面的接口，任何跑在 chat.deepseek.com
 // 上下文里的脚本都能调用（包括第三方脚本和潜在的 XSS）。主进程必须自己确认
@@ -86,6 +114,16 @@ function assertTrustedSender(event) {
 }
 function assertAiViewSender(event) {
   if (!senderIsAiView(event)) throw new Error("非法的 IPC 来源");
+  // 地址栏现在能打开任意站点，而 aiView 始终是同一个 webContents —— 只比对
+  // event.sender.id 等于「请求来自这个视图就放行」，第三方页面照样能发。
+  // preload 那边按域名自我关闭了，但那是注入侧的单点判断，主进程不能只依赖它。
+  // isTrustedUrl 内部已强制 https：明文 HTTP 下中间人可以往页面里塞一个
+  // <pre>dir</pre>，只看 hostname 的话 http://chat.deepseek.com 就能拿到本地执行。
+  let src = "";
+  try { src = event.sender.getURL(); } catch (e) {}
+  if (!isTrustedUrl(src)) {
+    throw new Error("来源页面不是 https 的 DeepSeek 站点");
+  }
 }
 
 // ============ 主题管理 ============
@@ -147,7 +185,18 @@ function broadcastTheme() {
   applyWebThemeCss();
 }
 
-async function applyWebThemeCss() {
+// dom-ready 与 did-finish-load 都会调进来，两者可能几乎同时到达：并发执行时各自
+// insertCSS 一次，却只记得最后一个 key，前一条永远删不掉（每次导航累积一条残留
+// 样式）。用 promise 链把它串行化。
+let themeCssChain = Promise.resolve();
+function applyWebThemeCss() {
+  themeCssChain = themeCssChain
+    .then(applyWebThemeCssNow)
+    .catch((e) => console.warn("[Theme] 注入失败:", e.message));
+  return themeCssChain;
+}
+
+async function applyWebThemeCssNow() {
   if (!aiView || aiView.webContents.isDestroyed()) return;
   try {
     if (webThemeCssKey) {
@@ -262,6 +311,24 @@ function onWorkerMessage(msg) {
   if (msg.type === "ready" || msg.type === "pong") return;
   if (msg.type === "crashed") {
     console.error("[runner] 执行进程内部崩溃:", msg.error);
+    // 崩溃的那一侧可能已经把 worker 的串行队列卡住，pending 的请求永远等不到回复。
+    // 带 id 就只结掉那一个；不带 id 说明进程状态未知，把全部 pending 判失败，
+    // 否则渲染进程的 invoke 要挂到 135 秒超时才有结果。
+    const reason = new Error("执行进程内部崩溃: " + (msg.error || "未知"));
+    if (typeof msg.id === "string" && msg.id) {
+      const one = workerPending.get(msg.id);
+      if (one) {
+        workerPending.delete(msg.id);
+        clearTimeout(one.timer);
+        one.reject(reason);
+      }
+    } else {
+      for (const [, entry] of workerPending) {
+        clearTimeout(entry.timer);
+        entry.reject(reason);
+      }
+      workerPending.clear();
+    }
     return;
   }
   const entry = workerPending.get(msg.id);
@@ -1291,6 +1358,9 @@ app.whenReady().then(async () => {
   loadThemeConfig();
 
   Menu.setApplicationMenu(null);
+
+  // 必须在任何页面加载之前装好，否则首个站点的权限请求会走默认弹窗
+  hardenPermissions(session.defaultSession);
 
   createWindow();
   createTray();

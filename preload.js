@@ -8,9 +8,12 @@ const { contextBridge, ipcRenderer } = require("electron");
 // 所以非 DeepSeek 域名直接结束：不暴露桥、不建 MutationObserver、不注入 GLM 面板。
 // 顶层 return 在 preload 的 CommonJS 包装里合法（main.js 的单实例锁用的就是它）。
 var __host = "";
-try { __host = location.hostname.toLowerCase(); } catch (e) {}
-if (__host !== "deepseek.com" && !__host.endsWith(".deepseek.com")) {
-  console.log("[DeepSeek Desktop] 非 DeepSeek 站点，注入能力已关闭");
+var __proto = "";
+try { __host = location.hostname.toLowerCase(); __proto = location.protocol; } catch (e) {}
+// 必须 https：主进程放开地址栏之后，http://chat.deepseek.com 也能加载这个脚本，
+// 明文连接上的中间人可以直接往页面里塞代码块来触发本地执行。
+if (__proto !== "https:" || (__host !== "deepseek.com" && !__host.endsWith(".deepseek.com"))) {
+  console.log("[DeepSeek Desktop] 非 https 的 DeepSeek 站点，注入能力已关闭");
   return;
 }
 

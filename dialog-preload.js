@@ -15,8 +15,17 @@ try {
   console.error("[dialog] 解析数据失败:", e.message);
 }
 
+// dialog.html 假定 reasons 每一项都是字符串并直接调 .match()。只要主进程传来
+// 非 string 项，那段渲染就会抛异常，风险详情和删除警告整块消失 —— 弹窗看起来
+// 「没有风险」，反而诱导用户点允许。统一转成字符串再暴露。
+const safeData = {
+  reasons: Array.isArray(dialogData.reasons)
+    ? dialogData.reasons.map((r) => String(r)).filter((r) => r.length > 0)
+    : []
+};
+
 contextBridge.exposeInMainWorld("dialogAPI", {
-  data: dialogData,
+  data: safeData,
   respond: function(allow) {
     ipcRenderer.send("dialog-respond", { allow: !!allow });
   }

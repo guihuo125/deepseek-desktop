@@ -27,7 +27,12 @@ $appId = ''
 if (Test-Path -LiteralPath $issFile) {
   $iss = Get-Content -LiteralPath $issFile -Raw
   $mA = [regex]::Match($iss, 'AppId\s*=\s*(\{[^}]+\})')
-  if ($mA.Success) { $appId = $mA.Groups[1].Value }
+  if ($mA.Success) {
+    # installer.iss writes AppId={{GUID} — the doubled brace is Inno's escape for a
+    # literal '{'. The registry key is {GUID}_is1, so without unescaping this match
+    # can never succeed and uninstall silently falls back to hardcoded paths.
+    $appId = ($mA.Groups[1].Value -replace '\{\{', '{')
+  }
 }
 if (-not $appId) {
   Step 'WARNING: AppId not found in installer.iss, falling back to exact name "DeepSeek"'
@@ -42,16 +47,33 @@ $regRoots = @(
   'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
   'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
 )
+# Inno writes UninstallString / QuietUninstallString quoted and sometimes with
+# trailing switches. Only the outer quotes can be stripped safely — splitting on
+# spaces would break "C:\Program Files\…".
+function Get-UninsPath($prop) {
+  foreach ($raw in @($prop.QuietUninstallString, $prop.UninstallString)) {
+    if (-not $raw) { continue }
+    $s = [string]$raw
+    $p = $null
+    if ($s -match '^\s*"([^"]+\.exe)"') { $p = $Matches[1] }
+    elseif ($s -match '^\s*(\S+\.exe)(\s|$)') { $p = $Matches[1] }
+    if ($p -and (Test-Path -LiteralPath $p)) { return $p }
+  }
+  return $null
+}
+
 foreach ($rk in $regRoots) {
   if (-not (Test-Path $rk)) { continue }
   foreach ($k in (Get-ChildItem $rk -ErrorAction SilentlyContinue)) {
     $prop = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
     if (-not $prop) { continue }
-    $mine = ($appId -and ($k.PSChildName -like ('*' + $appId + '*'))) -or
+    # exact key name ({GUID}_is1) first, exact display name second.
+    # Never use a *DeepSeek* wildcard: "DeepSeek Harness" is an unrelated product.
+    $mine = ($appId -and ($k.PSChildName -eq ($appId + '_is1'))) -or
             ($prop.DisplayName -eq 'DeepSeek')
-    if ($mine -and $prop.UninstallString) {
-      $path = ($prop.UninstallString -replace '^"','' -replace '"$','')
-      if ((Test-Path -LiteralPath $path) -and ($targets -notcontains $path)) { $targets += $path }
+    if ($mine) {
+      $p = Get-UninsPath $prop
+      if ($p -and ($targets -notcontains $p)) { $targets += $p }
     }
   }
 }
@@ -68,7 +90,12 @@ if ($targets.Count -eq 0) {
 } else {
   foreach ($u in $targets) {
     Step ('uninstalling: ' + $u)
-    Start-Process -FilePath $u -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+    $proc = Start-Process -FilePath $u -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+    # Inno: 0 = ok, 1 = user aborted, 2 = invalid parameter, 3 = aborted by system.
+    # Ignoring this would let the install proceed on top of a half-removed version.
+    if ($proc.ExitCode -ne 0) {
+      throw ('uninstaller exited with code ' + $proc.ExitCode + ' for ' + $u)
+    }
   }
 }
 
@@ -83,8 +110,14 @@ $pick = $pkgs | Sort-Object Ver -Descending | Select-Object -First 1
 Step ('installing v' + $pick.Ver + '  <- ' + $pick.File.Name + ' (' + [math]::Round($pick.File.Length / 1MB, 2) + ' MB)')
 
 # --- 5. silent install -------------------------------------------------------
-Start-Process -FilePath $pick.File.FullName `
-  -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+$inst = Start-Process -FilePath $pick.File.FullName `
+  -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+# Inno: 0 = ok, 1 = user aborted, 2 = invalid parameter. Without this check a failed
+# install still reaches step 6, where the *previous* DeepSeek.exe is still on disk
+# and everything looks green.
+if ($inst.ExitCode -ne 0) {
+  throw ('installer exited with code ' + $inst.ExitCode + ' for ' + $pick.File.Name)
+}
 
 # --- 6. locate and launch ----------------------------------------------------
 $exe = $null
@@ -96,6 +129,11 @@ if (-not $exe) { throw 'install reported no error but DeepSeek.exe was not found
 
 $vi = (Get-Item -LiteralPath $exe).VersionInfo
 Step ('installed: ' + $exe + '   version ' + $vi.ProductVersion)
+# The exe's version resource comes from build time, not from the package filename,
+# so a stale build can be shipped under a new version number. Compare explicitly.
+if ($vi.ProductVersion -notlike ([string]$pick.Ver + '*')) {
+  throw ('installed exe reports ' + $vi.ProductVersion + ' but the package was v' + $pick.Ver)
+}
 
 # If this script is invoked from an automation shell that exports
 # ELECTRON_RUN_AS_NODE=1, the child electron process degrades into a plain Node

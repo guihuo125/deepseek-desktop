@@ -1,11 +1,11 @@
 ; ==============================================
-; DeepSeek 桌面客户端 安装脚本 v1.2.0
+; DeepSeek 桌面客户端 安装脚本 v1.3.0
 ; 全中文界面 + 优化安装体验
 ; ==============================================
 
 #define MyAppName "DeepSeek"
 #define MyAppNameCN "DeepSeek 桌面客户端"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "DeepSeek"
 #define MyAppExeName "DeepSeek.exe"
 
@@ -16,6 +16,17 @@
 ; 不能只替换其中一个。
 #ifndef UnpackedDir
   #define UnpackedDir "dist\win-unpacked"
+#endif
+
+; 编译期校验：源目录必须是完整的构建产物。
+; 不带 /DUnpackedDir 时用默认值，而那个目录可能被清理成残缺状态（只剩 resources\），
+; 直接编会把旧构建甚至 exe 版本对不上的产物打成新版本号发出去，事后极难察觉。
+#define UnpackedFull SourcePath + UnpackedDir
+#if FileExists(UnpackedFull + "\DeepSeek.exe") == False
+  #error "打包源目录里没有 DeepSeek.exe。默认取 dist\win-unpacked，若你用的是其它构建输出，请传 /DUnpackedDir=dist-fixN\win-unpacked"
+#endif
+#if FileExists(UnpackedFull + "\resources\app.asar") == False
+  #error "打包源目录里没有 resources\app.asar，源目录可能已被清理成残缺状态。请重跑完整构建或用 /DUnpackedDir 指定正确目录"
 #endif
 
 [Setup]

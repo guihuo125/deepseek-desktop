@@ -18,6 +18,7 @@ const MAX_LOGS = 500;
 const MAX_LOG_CHARS = 2000;
 
 let busy = false;
+let currentId = "";   // 正在执行的任务 id：崩溃上报时要带回去，父进程才能结掉对应的 pending
 const queue = [];
 
 function post(msg) {
@@ -64,9 +65,10 @@ function pump() {
   if (busy || queue.length === 0) return;
   busy = true;
   const task = queue.shift();
+  currentId = task.id;
   execute(task).then(
-    function () { busy = false; pump(); },
-    function () { busy = false; pump(); }
+    function () { busy = false; currentId = ""; pump(); },
+    function () { busy = false; currentId = ""; pump(); }
   );
 }
 
@@ -75,6 +77,12 @@ process.parentPort.on("message", function (event) {
   if (!data || typeof data !== "object") return;
 
   if (data.type === "execute") {
+    // id 是父进程认领回复的唯一凭据。缺了它任务照样会跑完，但回包没人接收，
+    // 父进程只能白等到 EXEC_TIMEOUT_MS + 15s（135 秒）才失败。
+    if (typeof data.id !== "string" || !data.id) {
+      console.error("忽略缺少 id 的 execute 请求");
+      return;
+    }
     queue.push({
       id: data.id,
       code: typeof data.code === "string" ? data.code : "",
@@ -96,8 +104,18 @@ process.parentPort.on("disconnect", function () {
   process.exit(0);
 });
 
-process.on("uncaughtException", function (e) {
-  post({ type: "crashed", error: (e && e.message) || String(e) });
-});
+// 异常若发生在 execute 的 promise 链之外（runner 的看门狗定时器、spawn 的
+// error 回调等），busy 会永远停在 true，队列再也不 drain —— 之后每一次执行
+// 都要等满父进程超时。所以崩溃上报必须同时复位状态。
+function recoverFromCrash(e) {
+  post({ id: currentId, type: "crashed", error: (e && e.message) || String(e) });
+  busy = false;
+  currentId = "";
+  try { runner.killAllLiveProcs(); } catch (err) {}
+  pump();
+}
+
+process.on("uncaughtException", function (e) { recoverFromCrash(e); });
+process.on("unhandledRejection", function (e) { recoverFromCrash(e); });
 
 post({ type: "ready" });
