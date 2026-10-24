@@ -154,6 +154,10 @@ async function applyWebThemeCss() {
       await aiView.webContents.removeInsertedCSS(webThemeCssKey).catch(() => {});
       webThemeCssKey = null;
     }
+    // 下面两套 CSS 里有 html, body { background: … !important } 这种全局规则，
+    // 且选择器是按 DeepSeek 的 DOM 写的。地址栏现在能打开任意站点，注入过去
+    // 会把别人的配色整个改坏，所以只对 DeepSeek 生效。
+    if (!isTrustedUrl(aiView.webContents.getURL())) return;
     const css = resolvedTheme === "dark" ? WEB_THEME_DARK : WEB_THEME_LIGHT;
     webThemeCssKey = await aiView.webContents.insertCSS(css, { cssOrigin: "user" });
   } catch (e) {
@@ -588,29 +592,29 @@ function createWindow() {
   });
 
   // === 11. 外部链接用默认浏览器打开 ===
+  // 新窗口（target=_blank / window.open）仍然交给系统浏览器：应用内只有一个
+  // aiView，要开多窗口得重做布局和注入归属，收益不值。
+  // 但协议从「只 https」放宽到 http/https，与地址栏保持一致，
+  // 否则 http 站点弹出的链接会被静默丢弃、看起来像点了没反应。
   aiView.webContents.setWindowOpenHandler(({ url }) => {
-    try {
-      const u = new URL(url);
-      if (u.protocol === "https:") shell.openExternal(url);
-    } catch (e) {}
+    let proto = "";
+    try { proto = new URL(url).protocol; } catch (e) {}
+    if (proto === "https:" || proto === "http:") shell.openExternal(url);
     return { action: "deny" };
   });
 
   // === 12. 拦截导航 ===
-  // DeepSeek 是 SPA，站内切换走 history API 不触发 will-navigate；
-  // 这里拦下的是真实的 <a> 跳转，交给系统浏览器。
+  // 地址栏现在可以浏览任意站点，所以不再把非 DeepSeek 的跳转踢回系统浏览器——
+  // 那样点一下站内链接就跳出应用，浏览体验是断的。
+  // 仍然只放行 http/https：file: 是本地文件读取，devtools:/chrome:/view-source:
+  // 触碰渲染器内部，search-ms:/ms-msdt:/自定义协议等于把系统协议处理器交给网页驱动。
+  // 注入能力已按域名自我关闭（见 preload.js 顶部），放开导航不会带来本地执行。
   aiView.webContents.on("will-navigate", (e, url) => {
-    if (isTrustedUrl(url)) return;
-    e.preventDefault();
-    // 只能把 http/https 丢给系统浏览器。
-    // 其余协议（file:、search-ms:、ms-msdt:、自定义协议处理器）交给
-    // ShellExecute 等于让网页驱动系统协议处理器，是现成的攻击面。
     let proto = "";
     try { proto = new URL(url).protocol; } catch (e2) {}
-    if (proto === "http:" || proto === "https:") {
-      shell.openExternal(url);
-    } else {
-      console.warn("[Main] 拒绝打开非 http(s) 导航:", String(url).substring(0, 200));
+    if (proto !== "http:" && proto !== "https:") {
+      e.preventDefault();
+      console.warn("[Main] 拒绝非 http(s) 导航:", String(url).substring(0, 200));
     }
   });
 
@@ -899,8 +903,19 @@ ipcMain.handle("shell-navigate", async (event, url) => {
 
   let targetUrl = url.trim();
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
-  if (!isTrustedUrl(targetUrl)) {
-    return { ok: false, error: "只允许跳转到 DeepSeek 域名（https://*.deepseek.com）" };
+
+  // 域名不再限制（地址栏就是拿来浏览任意站点的），但协议必须限制：
+  //   file:            等于让网页驱动本地文件读取
+  //   devtools:/chrome:/view-source:  触碰渲染器内部
+  //   javascript:      在页面上下文执行任意脚本
+  //   search-ms:/ms-msdt:/自定义协议   系统协议处理器利用
+  // 注入能力已按域名自我关闭（见 preload.js 顶部），所以这里放开不会带来本地执行。
+  let proto = "";
+  try { proto = new URL(targetUrl).protocol; } catch (e2) {
+    return { ok: false, error: "URL 无法解析" };
+  }
+  if (proto !== "https:" && proto !== "http:") {
+    return { ok: false, error: "只允许 http/https 协议" };
   }
   if (!aiView || aiView.webContents.isDestroyed()) return { ok: false, error: "窗口未就绪" };
 

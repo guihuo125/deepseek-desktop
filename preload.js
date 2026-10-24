@@ -1,6 +1,19 @@
 
 const { contextBridge, ipcRenderer } = require("electron");
 
+// 地址栏现在可以导航到任意站点，而 preload 是绑在 webContents 上的：换站点后
+// 这个文件照样会被完整加载一遍。如果不按域名自我关闭，任何页面只要在 DOM 里放一个
+// <pre>dir</pre> 或 read(...) 样的代码块，下面的扫描逻辑就会把它当成本地待执行代码
+// 跑掉并把结果回传 —— 等于把执行入口开放给全网。
+// 所以非 DeepSeek 域名直接结束：不暴露桥、不建 MutationObserver、不注入 GLM 面板。
+// 顶层 return 在 preload 的 CommonJS 包装里合法（main.js 的单实例锁用的就是它）。
+var __host = "";
+try { __host = location.hostname.toLowerCase(); } catch (e) {}
+if (__host !== "deepseek.com" && !__host.endsWith(".deepseek.com")) {
+  console.log("[DeepSeek Desktop] 非 DeepSeek 站点，注入能力已关闭");
+  return;
+}
+
 // 只暴露无害的元信息。
 // executeCode / checkCode / setGlmConfig 这些能力接口曾经也挂在这里，
 // 但页面里没有任何代码调用它们 —— 全部由本文件的 preload 代码直接用 ipcRenderer 完成。
