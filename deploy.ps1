@@ -96,6 +96,22 @@ if (-not $exe) { throw 'install reported no error but DeepSeek.exe was not found
 
 $vi = (Get-Item -LiteralPath $exe).VersionInfo
 Step ('installed: ' + $exe + '   version ' + $vi.ProductVersion)
+
+# If this script is invoked from an automation shell that exports
+# ELECTRON_RUN_AS_NODE=1, the child electron process degrades into a plain Node
+# interpreter and dies immediately (require("electron").app becomes undefined).
+# Never let that leak into the app we are launching.
+if (Test-Path 'Env:ELECTRON_RUN_AS_NODE') {
+  Step 'clearing ELECTRON_RUN_AS_NODE for the launched process'
+  Remove-Item 'Env:ELECTRON_RUN_AS_NODE' -ErrorAction SilentlyContinue
+}
 Start-Process -FilePath $exe
-Step 'launched'
+
+# Confirm it actually stayed up; a silent crash here used to look like a broken build.
+$alive = $false
+for ($i = 0; $i -lt 6; $i++) {
+  Start-Sleep -Seconds 2
+  if (@(Get-Process -Name 'DeepSeek' -ErrorAction SilentlyContinue).Count -gt 0) { $alive = $true; break }
+}
+if ($alive) { Step 'launched and running' } else { throw 'app launched but no DeepSeek.exe process survived 12s' }
 Step 'done'

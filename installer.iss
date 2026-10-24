@@ -9,6 +9,15 @@
 #define MyAppPublisher "DeepSeek"
 #define MyAppExeName "DeepSeek.exe"
 
+; 打包源目录。默认 electron-builder 的输出 dist\win-unpacked；
+; 若用其它目录构建（例如 dist-fix），编译时覆盖：
+;   ISCC /DUnpackedDir=dist-fix\win-unpacked installer.iss
+; 注意：DeepSeek.exe 内写有 app.asar 的完整性哈希，exe 与 asar 必须来自同一次构建，
+; 不能只替换其中一个。
+#ifndef UnpackedDir
+  #define UnpackedDir "dist\win-unpacked"
+#endif
+
 [Setup]
 AppId={{B8C4D5E6-1A2B-3C4D-5E6F-7A8B9C0D1E2F}
 AppName={#MyAppNameCN}
@@ -61,7 +70,7 @@ chinesesimp.LaunchApp=立即启动 {#MyAppNameCN}
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "附加选项：";
 
 [Files]
-Source: "{#SourcePath}dist\win-unpacked\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourcePath}{#UnpackedDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"
