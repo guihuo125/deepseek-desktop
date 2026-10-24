@@ -25,6 +25,12 @@
       "output": "dist",
       "buildResources": "assets"
     },
+    "extraResources": [
+      {
+        "from": "app-update.yml",
+        "to": "app-update.yml"
+      }
+    ],
     "files": [
       "main.js",
       "preload.js",
@@ -43,32 +49,13 @@
     "win": {
       "target": [
         {
-          "target": "nsis",
+          "target": "dir",
           "arch": [
             "x64"
           ]
         }
       ],
       "icon": "assets/icon.ico"
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowElevation": true,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "DeepSeek",
-      "artifactName": "DeepSeek-Setup-${version}.exe",
-      "installerIcon": "icon.ico",
-      "uninstallerIcon": "icon.ico",
-      "installerSidebar": "installer-sidebar.bmp",
-      "uninstallerSidebar": "installer-sidebar.bmp",
-      "installerHeader": "installer-header.bmp",
-      "installerLanguages": [
-        "zh_CN"
-      ],
-      "runAfterFinish": true
     },
     "publish": [
       {

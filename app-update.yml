@@ -1,0 +1,10 @@
+# electron-updater 的运行时配置。electron-builder 只在产 nsis 包时自动生成它，
+# 而本项目 win.target 是 dir（安装包交给 Inno Setup 编），所以必须自己提供，
+# 否则 resources\app-update.yml 缺失，checkForUpdates 会直接失败。
+# 由 package.json 的 build.extraResources 复制到 resources\ 下。
+# 改 owner/repo 时要与 package.json 的 publish 段同步。
+owner: guihuo125
+repo: deepseek-desktop
+provider: github
+releaseType: release
+updaterCacheDirName: deepseek-desktop-updater
