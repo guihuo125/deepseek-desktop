@@ -65,7 +65,10 @@ function pickCwd(opts, fallback) {
 }
 function pickTimeout(opts, fallback) {
   const v = opts && (opts.timeout || opts.timeoutMs);
-  return typeof v === "number" && v > 0 ? v : fallback;
+  if (typeof v !== "number" || !(v > 0)) return fallback;
+  // AI 可以传任意大数（1e12 就是约 31 年），单层定时器会形同虚设。
+  // 主进程那边还有 120s 总看门狗，这里把单次超时同样钉到 120s 以内。
+  return Math.min(v, 120000);
 }
 
 // 执行 shell 命令
@@ -261,13 +264,30 @@ function createTools(options) {
     // 用 realpath 解析符号链接与 junction。
     // path.normalize 只看字面量，旧实现下 `mklink /J link C:\Windows` 之后
     // write("link/system32/x", ...) 就能逃出工作区。
+    // 目标本身常常还不存在（write 新文件），这时要退到最近一个**存在**的祖先做
+    // realpath 再拼回剩余段：只对"整体存在"的路径取 realpath，等于把新文件这条
+    // 最常被用的写入路径完全放过了。
     const realBase = fs.realpathSync.native(cwdBase);
-    const realTarget = fs.existsSync(abs) ? fs.realpathSync.native(abs) : abs;
+    const realTarget = realpathWithMissing(abs);
 
     if (realTarget !== realBase && !realTarget.startsWith(realBase + path.sep)) {
       throw new Error("安全限制：禁止访问工作区之外的路径（" + realTarget + "）");
     }
     return realTarget;
+  }
+
+  function realpathWithMissing(p) {
+    const missing = [];
+    let cur = p;
+    while (!fs.existsSync(cur)) {
+      const parent = path.dirname(cur);
+      if (parent === cur) return p;
+      missing.unshift(path.basename(cur));
+      cur = parent;
+    }
+    let real;
+    try { real = fs.realpathSync.native(cur); } catch (e) { return p; }
+    return missing.length ? path.join(real, ...missing) : real;
   }
 
   function assertReadableSize(abs, limit) {
@@ -377,6 +397,10 @@ function createTools(options) {
         for (const e of entries) {
           if (results.length >= 500) { truncated = true; return; }
           if (e.name === "node_modules" || e.name === ".git") continue;
+          // 遍历不跟随符号链接：readdir 的Dirent 对链接既不是 isDirectory() 也不是
+          // isFile()，旧代码把它当普通文件 statSync+readFileSync，于是工作区里放一个
+          // 指向 C:\Users\me 的链接，glob/grep 就会把外面的内容读出来并随结果回传。
+          if (e.isSymbolicLink()) continue;
           const full = path.join(dir, e.name);
           if (e.isDirectory()) {
             walk(full, depth + 1);
@@ -420,6 +444,10 @@ function createTools(options) {
         for (const e of entries) {
           if (results.length >= 100) { truncated = true; return; }
           if (e.name === "node_modules" || e.name === ".git") continue;
+          // 遍历不跟随符号链接：readdir 的Dirent 对链接既不是 isDirectory() 也不是
+          // isFile()，旧代码把它当普通文件 statSync+readFileSync，于是工作区里放一个
+          // 指向 C:\Users\me 的链接，glob/grep 就会把外面的内容读出来并随结果回传。
+          if (e.isSymbolicLink()) continue;
           const full = path.join(dir, e.name);
           if (e.isDirectory()) { walk(full, depth + 1); continue; }
           if (!includeRe.test(e.name)) continue;
@@ -481,16 +509,32 @@ function createTools(options) {
 
         const outBufs = [];
         const errBufs = [];
+        // python 分支原先无上限累积：print('x'*10**9) 会把 worker 撑到 OOM，
+        // 触发 uncaughtException 复位后连带整条串行队列上的其它任务一起失败。
+        // bash 分支早就有 4MB 帽，这里对齐。
+        let pyOutBytes = 0, pyErrBytes = 0, pyTruncated = false;
         let finished = false;
 
-        proc.stdout.on("data", function (d) { outBufs.push(d); });
-        proc.stderr.on("data", function (d) { errBufs.push(d); });
+        proc.stdout.on("data", function (d) {
+          if (pyOutBytes >= MAX_SHELL_OUTPUT_BYTES) { pyTruncated = true; return; }
+          pyOutBytes += d.length;
+          outBufs.push(d);
+        });
+        proc.stderr.on("data", function (d) {
+          if (pyErrBytes >= MAX_SHELL_OUTPUT_BYTES) { pyTruncated = true; return; }
+          pyErrBytes += d.length;
+          errBufs.push(d);
+        });
 
         function collect(extra) {
           const out = iconv.decode(Buffer.concat(outBufs), "utf-8");
           const err = iconv.decode(Buffer.concat(errBufs), "utf-8");
           let text = out;
           if (err) text += (text ? "\n[stderr]\n" : "[stderr]\n") + err;
+          if (pyTruncated) {
+            text += "\n...(输出超过 " + Math.round(MAX_SHELL_OUTPUT_BYTES / 1024 / 1024) +
+              "MB 上限，后续内容已丢弃)";
+          }
           return text + (extra || "");
         }
 

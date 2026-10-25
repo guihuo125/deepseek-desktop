@@ -6,27 +6,35 @@
 // 任何改动 security.js 之后都必须重跑，否则很容易在无意中放开一条绕过路径。
 
 const sec = require("../security.js");
+const path = require("path");
 
 let failures = 0;
 let total = 0;
 
+// 等级取值必须封闭：旧写法只判「不等于 safe」，于是 security.js 把 dangerous 拼错成
+// dangeour、或者所有拦截都退化成一个没人认识的字符串时，26 条「必须拦截」照样全绿。
+const VALID_LEVELS = ["safe", "dangerous", "forbidden"];
+
 function expectLevel(name, code, expected, options) {
   total++;
   const r = sec.checkCode(code, options);
-  const ok = expected === "safe" ? r.level === "safe" : r.level !== "safe";
+  const known = VALID_LEVELS.indexOf(r.level) !== -1;
+  const ok = known && (expected === "safe" ? r.level === "safe" : r.level !== "safe");
   if (!ok) {
     failures++;
     console.log("  ✗ " + name);
     console.log("      代码: " + code);
-    console.log("      期望: " + expected + "  实际: " + r.level);
+    console.log("      期望: " + expected + "  实际: " + r.level + (known ? "" : "（不是合法等级值）"));
     if (r.items[0]) console.log("      原因: " + r.items[0].desc);
   } else {
     console.log("  ✓ " + name + "  [" + r.level + "]");
   }
 }
 
-// 工作区路径本身带空格，用来同时验证引号路径的解析
-const WS = process.cwd();
+// 工作区路径本身带空格，用来同时验证引号路径的解析。
+// 必须锚定到项目根：用 process.cwd() 的话，从别的目录跑测试时
+// 「工作区内/外」的语义会整体漂移（曾经某条越界用例因此变成区内用例）。
+const WS = path.join(__dirname, "..");
 const INSIDE_PATH = WS.replace(/\\/g, "/") + "/src";
 const INSIDE_PATH_BS = WS.replace(/\\/g, "\\\\") + "\\\\src";
 
@@ -73,7 +81,7 @@ console.log("\n=== 用户策略：仅删除类/不可逆操作需要确认 ===")
 const AUTO_ALLOWED = [
   ["bash 重定向覆盖（非删除）", "bash(`echo x > /etc/passwd`)"],
   ["write 开机启动项后门",      'write("AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/hi.bat", "@echo off")'],
-  ["bash mklink junction",      "bash(`mklink /J link C:\\Windows`)"],
+  // ↑ 相对路径落在工作区内，按用户策略不弹窗；越界版本见下面「别名与越界」回归段
   ["edit 改文件",               'edit("main.js", "a", "b")'],
   ["write 覆盖文件",            'write("a.txt", "x")'],
   ["bash reg add",              "bash(`reg add HKCU\\Software /v x /d y`)"],
@@ -95,6 +103,58 @@ const BOUNDARY_BLOCK = [
   ["pwsh 家目录展开",               'return await pwsh("Get-Content ~/secret.txt");'],
 ];
 for (const [name, code] of BOUNDARY_BLOCK) expectLevel(name, code, "dangerous+", { workspace: WS });
+
+// ============ 第三批复审（2026-10-25）：别名 / 间接调用 / 编码执行 / 工具越界 ============
+// 这一批全部是审查时**实测判成 safe 并自动执行**过的载荷，不是理论推演。
+// 共同点：它们都没有触碰「删除」二字本身，而是换了个写法让关键字扫不到 ——
+// 而用户策略的本意是「不可逆操作必须弹」，不是「必须逐字写 rm 才弹」。
+console.log("\n=== 第三批复审：删除类换写法也必须拦住 ===");
+const BYPASS_BLOCK = [
+  ["PowerShell 别名 ri 递归删除",   'pwsh("ri C:\\\\Users\\\\me\\\\x -Recurse -Force")'],
+  ["cmd 别名 rd 静默递归删除",       'cmd("rd /s /q C:\\\\Users\\\\me\\\\x")'],
+  ["kill 结束进程（原表漏项）",      'bash("kill -9 1234")'],
+  ["别名 f = bash 后间接调用",       'let f = bash; f("ri C:\\\\Users\\\\me\\\\x -Recurse -Force")'],
+  ["逗号表达式 (0,bash) 间接调用",   '(0,bash)("ri C:\\\\Users\\\\x -Force")'],
+  ["成员调用 o.bash 间接引用",       'const o = { bash: bash }; o.bash("ri C:\\\\x -Force")'],
+  ["模板字面量里藏别名 ri",          'pwsh(`ri C:\\\\Users\\\\x -Recurse -Force`)'],
+  ["powershell -EncodedCommand",    'pwsh("powershell -NoProfile -EncodedCommand ZABlAGwAZQByAGUAdABlACI=")'],
+  ["iex + FromBase64String",        'pwsh("iex ([Convert]::FromBase64String(\\"cm0gLXJmIC8A\\"))")'],
+  ["python b64decode + exec",       'python("import base64;exec(base64.b64decode(\\"b3MucmVtb3ZlKHg=\\"))")'],
+  ["Add-Type 内存编译执行",          'pwsh("Add-Type -TypeDefinition $src")'],
+  ["wmic 删卷影（vssadmin 同语义）",  'bash("wmic shadowcopy delete")'],
+  ["wbadmin 删备份",                 'bash("wbadmin delete catalog -quiet")'],
+  ["reg delete 删注册表项",          'bash("reg delete HKCU\\\\Software\\\\X /f")'],
+  ["重定向写进启动目录",             'bash("echo x > C:\\\\Users\\\\me\\\\AppData\\\\Roaming\\\\Microsoft\\\\Windows\\\\Start Menu\\\\Programs\\\\Startup\\\\a.bat")'],
+  ["copy 把桌面文件复制出去",        'bash("copy /y C:\\\\Users\\\\me\\\\Desktop\\\\a.txt D:\\\\pub")'],
+  ["move 覆盖系统 hosts",            'bash("move /y C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts D:\\\\bak")'],
+  ["sc(Set-Content) 越界覆盖写",     'pwsh("sc C:\\\\Users\\\\me\\\\z.txt pwned")'],
+  ["mklink 造目录联接",              'bash("mklink /J link C:\\\\Windows")'],
+  ["裸 set 导出环境变量",            'bash("set")'],
+  ["get-childitem env: 导出环境变量", 'pwsh("get-childitem env:")'],
+  ["read 越界读私钥",                'read("C:\\\\Users\\\\me\\\\.ssh\\\\id_rsa")'],
+  ["grep 越界读凭据（路径在 opts.path）", 'grep("aws_secret", { path: "C:\\\\Users\\\\me\\\\.aws\\\\credentials" })'],
+  ["write 越界写系统目录",           'write("C:\\\\Windows\\\\System32\\\\x.dll", "dll")']
+];
+for (const [name, code] of BYPASS_BLOCK) expectLevel(name, code, "dangerous+", { workspace: WS });
+
+// 反向钉子：用户明确放开的这些写法，不能被上面这批收紧顺手带回去。
+// 收紧「删除必须弹」不等于回到「一律确认」——这两条同时成立才算改对。
+console.log("\n=== 收紧之后仍须自动执行（防过度拦截）===");
+const STILL_AUTO = [
+  ["管道只读查询",            'pwsh("Get-Process chrome | Select-Object -First 3")'],
+  ["引用单个 $env: 变量",     'bash("echo $env:PATH")'],
+  ["git status",              'bash("git status")'],
+  ["npm install",             'pwsh("npm install")'],
+  ["读工作区内相对路径",       'read("src/main.js")'],
+  ["写工作区内文件",           'write("out/a.txt", "x")'],
+  ["注册表路径不该被当盘符越界", 'pwsh("Get-ItemProperty HKCU:\\\\Software\\\\X")'],
+  ["bash 里出现 python 字样",  'bash("python -c \\"print(1)\\"")'],
+  ["裸代码无工具调用",         'const x = 1; return x;'],
+  // 路径来自变量不升级成弹窗：`const f="src/a.js"; read(f)` 是常见写法，
+  // 真越界由 runner.safePath 在执行侧拦住（见 runner.test.js 的越界用例）。
+  ["read 路径由变量给出",      'var p = "src/a.js"; read(p)']
+];
+for (const [name, code] of STILL_AUTO) expectLevel(name, code, "safe", { workspace: WS });
 
 // 注释里提到危险命令不应触发 FORBIDDEN 硬拦截（否则无法放行，误伤代价太高），
 // 但字符串里的必须拦住

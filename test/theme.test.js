@@ -117,6 +117,9 @@ console.log("\n== 与壳层设计源不能漂移 ==");
 for (const tok of ["--bg-canvas", "--bg-subtle", "--accent", "--text-primary", "--border-default"]) {
   const inShell = (shell.match(new RegExp(tok + ":\\s*(#[0-9A-Fa-f]{6})", "i")) || [])[1];
   const inWeb = (web.match(new RegExp(tok + ":\\s*(#[0-9A-Fa-f]{6})", "i")) || [])[1];
+  // 先确认两边都解析到了值：两个 undefined 相等也会判"同值"通过，
+  // 于是把色值改成 oklch() 或两边一起改名时，这五条全绿而契约已断。
+  ok(inWeb !== undefined && inShell !== undefined, tok + " 在两份文件里都能解析到 6 位 hex");
   eq(inWeb, inShell, tok + " 两份文件同值");
 }
 
@@ -215,15 +218,38 @@ const reducedShell = blockAfter(shellCode, "@media (prefers-reduced-motion: redu
 ok(/transition-duration:\s*1ms/.test(reducedShell), "壳层有减弱动效降级");
 ok(!/@keyframes/.test(webCode), "网页侧不自造关键帧动画（不与宿主动画叠加）");
 
+console.log("\n== 内核：执行进程空闲回收与日志上限 ==");
+// 执行器常驻会白占一份 utilityProcess 内存；长任务日志无上限会把主进程撑大。
+// 只钉常量声明没有意义（把使用它的那行删掉，常量还在、测试全绿），
+// 所以每条都同时钉住「声明」与「真实使用点」。
+ok(/WORKER_IDLE_MS\s*=\s*5 \* 60 \* 1000/.test(mainJs), "执行进程空闲 5 分钟后回收");
+ok(/\}, WORKER_IDLE_MS\)/.test(mainJs), "空闲计时器真的用这个常量设时长");
+ok(/if \(workerPending\.size !== 0\) return;/.test(mainJs), "有在飞任务时不回收执行进程");
+ok(/MAX_WORKER_LOGS\s*=\s*400/.test(mainJs), "单任务日志条数上限常量");
+ok(/entry\.logs\.length >= MAX_WORKER_LOGS/.test(mainJs), "条数上限真的参与截断判定");
+ok(/MAX_WORKER_LOG_CHARS\s*=\s*128 \* 1024/.test(mainJs), "单任务日志字符上限常量");
+ok(/entry\.logChars >= MAX_WORKER_LOG_CHARS/.test(mainJs), "字符上限真的参与截断判定");
+ok(/clearWorkerIdle\(\);\s*\n\s*const id = "w"/.test(mainJs), "开始执行前取消空闲计时");
+ok(!/跳过（无工具调用）/.test(preloadCode), "扫描热路径不再打印跳过日志");
+
 console.log("\n== 连接信息浮层：独立视图，不再挤开页面 ==");
 // 壳层是窗口底层 webContents，aiView 盖在它上面。旧做法是把网页缩窄让位，
 // 症状就是打开锁面板时正文列被整块推走。改成独立 WebContentsView 后，
 // 网页几何必须一点不动 —— 这几条守住那个结构。
 const shellHtml = fs.readFileSync(path.join(root, "shell.html"), "utf8");
 const securityHtml = fs.readFileSync(path.join(root, "security.html"), "utf8");
+const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const issText = fs.readFileSync(path.join(root, "installer.iss"), "utf8");
 ok(/security\.html/.test(mainJs) && /security-preload\.js/.test(mainJs), "主进程加载独立的安全浮层文档");
-ok(mainJs.indexOf("addChildView(securityView)") > mainJs.indexOf("addChildView(aiView)"),
-  "安全浮层在 aiView 之后添加，层级在其上方");
+// main.js 引用了 ≠ 会进包：漏加 build.files 时 electron-builder 静默不打包，
+// 装完后浮层是空白页，而上面那两条断言照样绿。
+for (const f of ["security.html", "security-preload.js"]) {
+  ok(pkg.build.files.includes(f), "build.files 收录了 " + f + "（漏了就装包里没这个文件）");
+}
+const idxAi = mainJs.indexOf("addChildView(aiView)");
+const idxSec = mainJs.indexOf("addChildView(securityView)");
+ok(idxAi >= 0 && idxSec >= 0, "两处 addChildView 都还在（任一处改名会让下面的比较失去意义）");
+ok(idxSec > idxAi, "安全浮层在 aiView 之后添加，层级在其上方");
 ok(!/id="security-panel"/.test(shellHtml), "壳层不再保留安全面板 DOM");
 ok(!/setSecPanel/.test(shellHtml), "壳层不再为安全面板申请网页让位");
 ok(/insetForPanel\(true, settingsPanel/.test(shellHtml), "设置面板仍保留让位（按用户要求保持现状）");
@@ -232,7 +258,9 @@ ok(/lockBtn\.getBoundingClientRect\(\)/.test(shellHtml) && /toggleSecurityPanel\
 ok(/link rel="stylesheet" href="themes\/claude\.css"/.test(securityHtml), "浮层复用同一份主题令牌");
 ok(/onTheme/.test(securityHtml) && /data-theme/.test(securityHtml), "浮层跟随主题切换");
 ok(/Escape/.test(securityHtml), "浮层内按 Esc 可关闭");
-ok(/senderIsSecurityView/.test(mainJs), "主进程校验浮层来源，删除请求不认网页");
+// 钉使用点而不是函数定义：定义摆在那里就永远绿，把 close 通道上的守卫删掉也发现不了
+ok(/ipcMain\.on\("close-security-panel"[\s\S]{0,160}senderIsSecurityView\(event\)/.test(mainJs),
+  "关闭浮层的通道校验来源（壳层或浮层本身，别的文档不认）");
 
 console.log("\n== 设置页：功能补齐且不写假信息 ==");
 ok(!/DeepSeek 桌面客户端 v1\.0\.0/.test(shellHtml), "版本号不再写死 v1.0.0");
@@ -250,6 +278,50 @@ const actionBlock = (shellHtml.match(/\.sp-action-btn \{([^}]*)\}/) || [])[1] ||
 ok(pickTrans(toggleBlock).length > 0 && pickTrans(actionBlock).length > 0, "新设置控件有过渡声明");
 ok(!/(width|height|top|left|right|bottom|margin|padding)\s/.test(pickTrans(toggleBlock) + pickTrans(actionBlock)),
   "新设置控件的过渡只动颜色/位移，不动物理尺寸");
+
+console.log("\n== GLM 标识：用 Z.ai 官方轮廓，不再手画沙漏 ==");
+// 轮廓逐字取自 @lobehub/icons 的 ZAI 图标（viewBox 0 0 24 24）。
+// 早期版本是手绘的两个三角形，跟智谱实际标识不是一回事。
+const ZAI_PATH = "M12.105 2L9.927 4.953H.653L2.83 2h9.276zM23.254 19.048L21.078 22h-9.242l2.174-2.952h9.244zM24 2L9.264 22H0L14.736 2H24z";
+eq((preloadCode.match(new RegExp(ZAI_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length, 3,
+  "悬浮球 / 面板标题 / 空态三处用同一份 Z.ai 轮廓");
+ok(!/M9 6 L15 6|M8 8L16 8/.test(preloadCode), "手画的沙漏轮廓已清除");
+// 写死颜色有三种写法都算"不跟随主题"，只挡 white 一种等于没挡
+ok(!/fill=\\?["'](?:white|#fff(?:fff)?|#[Ff][Aa][Ff]9[Ff]5)\\?["']/.test(preloadCode),
+  "标识不再写死 white/#fff/#FAF9F5，改用 currentColor 跟随令牌");
+// 面板标题与空态那两处在 JS 字符串里，**两侧引号都是转义的**，正则要认这种形态
+eq((preloadCode.match(/fill=\\?"currentColor\\?"/g) || []).length, 3, "三处标识都用 currentColor");
+ok(/width="24" height="24"[^>]*aria-hidden="true"/.test(preloadCode), "56px 悬浮球里的标识占 24px 且对读屏隐藏");
+
+console.log("\n== 交付链路：版本号一致、语法可解析、引用文件都在包里 ==");
+// 2026-10-25 审查发现的三类静默失效，都在这里钉住：
+// ① package.json 与 installer.iss 各升各的 → 安装包里装的可能是上一次的产物；
+// ② npm test 从不检查 main.js 能否解析 → 语法错误照样打出"成功"的安装包；
+// ③ main.js 新引用的文件忘了进 build.files → 装完是空白浮层/缺字体。
+const issVer = (issText.match(/#define MyAppVersion\s+"([^"]+)"/) || [])[1];
+eq(issVer, pkg.version, "installer.iss 的 MyAppVersion 与 package.json 的 version 同值");
+ok(!/#define UnpackedDir\s+"dist/.test(issText),
+  "installer.iss 不给默认打包目录（默认值会停在旧产物，编出名字新、内容旧的包）");
+
+const { spawnSync } = require("child_process");
+const RUNTIME = ["main.js", "preload.js", "security.js", "runner.js", "runner-worker.js",
+  "shell-preload.js", "dialog-preload.js", "security-preload.js"];
+for (const f of RUNTIME) {
+  const r = spawnSync(process.execPath, ["--check", path.join(root, f)], { encoding: "utf8" });
+  eq(r.status, 0, f + " 能通过 node --check（语法错会被 electron-builder 原样打进包里）");
+}
+
+// main.js 用 path.join(__dirname, "...") 引用的每个顶层文件/目录都必须在 build.files 里
+const refSeg = new Set();
+for (const m of mainJs.matchAll(/path\.join\(__dirname,\s*["']([^"'/\\]+)(?:[\\/][^"']*)?["']/g)) {
+  refSeg.add(m[1]);
+}
+const plain = pkg.build.files.filter((f) => !f.startsWith("!") && !f.includes("**"));
+const globs = pkg.build.files.filter((f) => !f.startsWith("!") && f.includes("**")).map((f) => f.split("/")[0]);
+ok(refSeg.size >= 8, "确实从 main.js 抽到了 __dirname 引用（抽到 0 条时下面的循环会空跑）");
+for (const seg of refSeg) {
+  ok(plain.includes(seg) || globs.includes(seg), "main.js 引用的 " + seg + " 已在 build.files 中");
+}
 
 console.log("\n==================================================");
 if (failed) { console.log("失败 " + failed + " 项，通过 " + passed + " 项"); process.exit(1); }

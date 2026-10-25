@@ -34,11 +34,14 @@ if (Test-Path -LiteralPath $issFile) {
     $appId = ($mA.Groups[1].Value -replace '\{\{', '{')
   }
 }
+# No display-name fallback: the real DisplayName comes from
+# UninstallDisplayName={#MyAppNameCN} and is CJK, while this file must stay ASCII,
+# so a hardcoded name here silently never matched (2026-10-25 review). Fail loudly
+# instead of uninstalling nothing and installing over a dirty directory.
 if (-not $appId) {
-  Step 'WARNING: AppId not found in installer.iss, falling back to exact name "DeepSeek"'
-} else {
-  Step ("product AppId: " + $appId)
+  throw 'AppId not found in installer.iss - refusing to guess which product to uninstall'
 }
+Step ("product AppId: " + $appId)
 
 # --- 3. uninstall previous copies --------------------------------------------
 $targets = @()
@@ -67,10 +70,10 @@ foreach ($rk in $regRoots) {
   foreach ($k in (Get-ChildItem $rk -ErrorAction SilentlyContinue)) {
     $prop = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
     if (-not $prop) { continue }
-    # exact key name ({GUID}_is1) first, exact display name second.
-    # Never use a *DeepSeek* wildcard: "DeepSeek Harness" is an unrelated product.
-    $mine = ($appId -and ($k.PSChildName -eq ($appId + '_is1'))) -or
-            ($prop.DisplayName -eq 'DeepSeek')
+    # exact registry key name ({GUID}_is1) only.
+    # Never use a *DeepSeek* wildcard or a display-name match: "DeepSeek Harness"
+    # is an unrelated product on this machine, and our own DisplayName is CJK.
+    $mine = ($k.PSChildName -eq ($appId + '_is1'))
     if ($mine) {
       $p = Get-UninsPath $prop
       if ($p -and ($targets -notcontains $p)) { $targets += $p }
@@ -99,15 +102,33 @@ if ($targets.Count -eq 0) {
   }
 }
 
-# --- 4. pick the highest-versioned setup exe in inno-out ---------------------
+# --- 4. pick the setup exe that matches package.json --------------------------
+# Picking "highest version in inno-out" was wrong: when the ISCC step fails or is
+# skipped, the previous release's package is still sitting there, its filename
+# version matches the exe inside it, and the whole run reports success while the
+# machine stays on an old build. Compare against the source of truth instead.
+# Read the version with a regex, NOT ConvertFrom-Json: PowerShell 5.1 decodes
+# BOM-less UTF-8 as ANSI, so the CJK description field in package.json comes back
+# mangled and takes a quote character with it - ConvertFrom-Json then fails with
+# "invalid JSON" on a perfectly valid file. The version line is pure ASCII.
+$pkgText = Get-Content -LiteralPath (Join-Path $root 'package.json') -Raw
+$mPkg = [regex]::Match($pkgText, '"version"\s*:\s*"([^"]+)"')
+if (-not $mPkg.Success) { throw 'cannot read version from package.json' }
+$wantVer = $mPkg.Groups[1].Value
+
 $pkgs = @()
 foreach ($f in (Get-ChildItem -LiteralPath $outDir -Filter 'DeepSeek-Setup-*.exe' -ErrorAction SilentlyContinue)) {
-  $mV = [regex]::Match($f.Name, '^DeepSeek-Setup-(\d+(?:\.\d+)*)\.exe$')
-  if ($mV.Success) { $pkgs += [pscustomobject]@{ File = $f; Ver = [version]$mV.Groups[1].Value } }
+  $mV = [regex]::Match($f.Name, '^DeepSeek-Setup-([0-9A-Za-z.\-]+)\.exe$')
+  if ($mV.Success) { $pkgs += [pscustomobject]@{ File = $f; Ver = $mV.Groups[1].Value } }
 }
 if ($pkgs.Count -eq 0) { throw ("no DeepSeek-Setup-*.exe found in " + $outDir) }
-$pick = $pkgs | Sort-Object Ver -Descending | Select-Object -First 1
-Step ('installing v' + $pick.Ver + '  <- ' + $pick.File.Name + ' (' + [math]::Round($pick.File.Length / 1MB, 2) + ' MB)')
+$pick = $pkgs | Where-Object { $_.Ver -eq $wantVer } | Select-Object -First 1
+if (-not $pick) {
+  throw ("inno-out has no package for version " + $wantVer +
+         " (found: " + (($pkgs | ForEach-Object { $_.Ver }) -join ', ') + ")")
+}
+Step ('installing v' + $pick.Ver + '  <- ' + $pick.File.Name +
+      ' (' + [math]::Round($pick.File.Length / 1MB, 2) + ' MB, built ' + $pick.File.LastWriteTime + ')')
 
 # --- 5. silent install -------------------------------------------------------
 $inst = Start-Process -FilePath $pick.File.FullName `
@@ -131,8 +152,10 @@ $vi = (Get-Item -LiteralPath $exe).VersionInfo
 Step ('installed: ' + $exe + '   version ' + $vi.ProductVersion)
 # The exe's version resource comes from build time, not from the package filename,
 # so a stale build can be shipped under a new version number. Compare explicitly.
-if ($vi.ProductVersion -notlike ([string]$pick.Ver + '*')) {
-  throw ('installed exe reports ' + $vi.ProductVersion + ' but the package was v' + $pick.Ver)
+# Exact match (allowing the trailing ".0" that Win32 file versions carry):
+# a -like 'X*' prefix check passed package 1.6.1 against an exe built as 1.6.12.
+if ($vi.ProductVersion -notmatch ('^' + [regex]::Escape($wantVer) + '(\.0)?$')) {
+  throw ('installed exe reports ' + $vi.ProductVersion + ' but package.json says ' + $wantVer)
 }
 
 # If this script is invoked from an automation shell that exports

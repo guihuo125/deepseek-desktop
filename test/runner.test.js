@@ -172,6 +172,14 @@ async function run(code, workspace) {
       r = await run('return await read("junction/secret.txt");');
       check("junction 指向工作区外时 realpath 拦截生效",
         !r.ok && /安全限制/.test(r.error || ""), r.error || JSON.stringify(String(r.result).slice(0, 60)));
+      // 上面那条走的是"目标已存在"分支。真正漏的是另一条：write 新文件时目标不存在，
+      // 旧实现直接拿字面量路径比较，父目录是 junction 这件事根本没被发现。
+      r = await run('return await write("junction/escaped.txt", "pwned");');
+      check("junction 目录下写一个不存在的新文件同样被拦",
+        !r.ok && /安全限制/.test(r.error || ""), r.error || JSON.stringify(String(r.result).slice(0, 60)));
+      check("越界写入确实没有落盘（工作区外目录里不该多出这个文件）",
+        !fs.existsSync(path.join(outside, "escaped.txt")));
+      try { fs.rmdirSync(linkPath); } catch (e) { /* 只删链接本身，不碰目标 */ }
     } else {
       console.log("  - 跳过 junction 测试（无法创建目录链接）");
     }

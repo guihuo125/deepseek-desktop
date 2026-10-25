@@ -1,6 +1,6 @@
 {
   "name": "deepseek-desktop",
-  "version": "1.6.10",
+  "version": "1.6.13",
   "description": "DeepSeek 桌面客户端",
   "main": "main.js",
   "scripts": {

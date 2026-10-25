@@ -141,7 +141,11 @@ function init() {
 
   // 用户发送消息（按 Enter 或点输入区按钮）才算「本次请求」。
   // 自动执行只服务本次请求的回复；没有这个信号时，页面上的块一律按历史处理。
+  // 必须查 e.isTrusted：页面自己的脚本可以 dispatchEvent 一个假的 Enter
+  // 或假的 click，把 lastUserActionAt 刷成"刚刚发过消息"，从而让
+  // isHistoricalBlock 判假、把任意伪造文本当新回复自动执行。
   document.addEventListener("keydown", function(e) {
+    if (!e.isTrusted) return;
     if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
     var t = e.target;
     if (t && t.tagName === "TEXTAREA" && (t.value || "").trim()) {
@@ -149,6 +153,7 @@ function init() {
     }
   }, true);
   document.addEventListener("click", function(e) {
+    if (!e.isTrusted) return;
     var ta = document.querySelector("textarea");
     if (!ta || !(ta.value || "").trim()) return;
     var node = e.target;
@@ -180,6 +185,7 @@ function init() {
       // 并把「本次请求」标记清掉——上一个会话的操作不能带进新会话。
       historyGuardUntil = Date.now() + HISTORY_GUARD_MS;
       lastUserActionAt = 0;
+      clearPendingBlocks();
     }
     regionPass();
   });
@@ -344,7 +350,8 @@ function tagBubbles() {
 // 它们混进扫描环有两个代价：白烧 CPU（面板每次渲染都触发 characterData），
 // 以及万一 GLM 回复里写了 bash(...) 示例，会被当成待执行代码自动跑起来。
 function isInjectedUI(el) {
-  return !!(el && el.closest && el.closest("#adshield-ai-sidebar, #adshield-glm-settings"));
+  return !!(el && el.closest &&
+    el.closest("#adshield-ai-sidebar, #adshield-glm-settings, #adshield-glm-container"));
 }
 
 // 从一条 mutation 记录里收集受影响的 <pre>
@@ -489,16 +496,17 @@ function scanPre(pre) {
   }
   if (!maybeTool) return;
 
-  // 检查父元素（往上 4 层）是否含 "cuckoo"
-  var hasCuckoo = false;
-  var node = pre;
-  for (var up = 0; up < 4; up++) {
-    if (!node.parentElement) break;
-    node = node.parentElement;
-    var t = (node.innerText || node.textContent || "");
-    if (t.toLowerCase().indexOf("cuckoo") !== -1) { hasCuckoo = true; break; }
-  }
-  if (!hasCuckoo) return;
+  // 代码块外壳用宿主的稳定类名 .md-code-block，语言标签在它的 banner 里。
+  // 只读这两层的 textContent：向上走到 4~5 层就进了消息列表根，那里
+  // ① 读 innerText 会强制重排并把整段会话正文序列化（流式期间每 600ms 一次），
+  // ② 用整条消息的文本判 skipMarkers，会让「用法示例：dir」这种说明文字
+  //    把同一条回复里真正要执行的块整块丢掉，且不留任何提示。
+  var shell = (pre.closest && pre.closest(".md-code-block")) || pre.parentElement || pre;
+  var banner = shell.querySelector
+    ? shell.querySelector(".md-code-block-banner-wrap, .md-code-block-banner")
+    : null;
+  var shellText = ((banner && banner.textContent) || shell.textContent || "");
+  if (shellText.toLowerCase().indexOf("cuckoo") === -1) return;
 
   // 提取代码（优先 code 子元素，否则用 pre 本身）
   var codeEl = pre.querySelector("code") || pre;
@@ -507,15 +515,9 @@ function scanPre(pre) {
   codeText = decodeHtmlEntities(codeText);
   // 清理零宽字符 + 全角标点
   codeText = sanitizeCode(codeText);
-  console.log("[DeepSeek Desktop] 提取代码:", JSON.stringify(codeText.substring(0, 200)));
 
-  // ★ 过滤：跳过系统提示 / 说明性代码块
-  var blockContainer = pre;
-  for (var up2 = 0; up2 < 5; up2++) {
-    if (!blockContainer.parentElement) break;
-    blockContainer = blockContainer.parentElement;
-  }
-  var containerText = (blockContainer.innerText || blockContainer.textContent || "");
+  // ★ 过滤：跳过系统提示 / 说明性代码块（只看代码块自身的外壳与正文）
+  var scopeText = shellText + "\n" + codeText;
   var skipMarkers = [
     "你是由 Cuckoo Code 驱动",
     "你是由Cuckoo",
@@ -534,8 +536,7 @@ function scanPre(pre) {
     "代码块最后请用"
   ];
   for (var sm = 0; sm < skipMarkers.length; sm++) {
-    if (containerText.indexOf(skipMarkers[sm]) !== -1) {
-      console.log("[DeepSeek Desktop] 跳过系统提示块");
+    if (scopeText.indexOf(skipMarkers[sm]) !== -1) {
       return;
     }
   }
@@ -547,15 +548,12 @@ function scanPre(pre) {
     if (codeText.indexOf(TOOL_MARKERS[tt]) !== -1) { looksLikeCode = true; break; }
   }
   if (!looksLikeCode) {
-    console.log("[DeepSeek Desktop] 跳过（无工具调用）:", JSON.stringify(codeText.substring(0, 80)));
     return;
   }
   if (codeText.length < 10) {
-    console.log("[DeepSeek Desktop] 跳过（太短）:", JSON.stringify(codeText));
     return;
   }
   if (!/[;{}(=]/.test(codeText) && codeText.indexOf("\\n") === -1) {
-    console.log("[DeepSeek Desktop] 跳过（无代码特征）:", JSON.stringify(codeText.substring(0, 80)));
     return;
   }
 
@@ -588,7 +586,15 @@ function scanPre(pre) {
   // 内容哈希跨渲染去重：虚拟列表滚动重挂载、编辑消息都会换掉 DOM 节点，
   // 只按元素记账会让同一段旧代码被重新执行。哈希带上会话路径，不同会话互不影响。
   var codeKey = codeKeyFor(codeText);
-  if (isProcessed(pre, id) || isProcessed(null, codeKey)) return;
+  if (isProcessed(pre, id)) return;
+  if (isProcessed(null, codeKey)) {
+    // 虚拟列表把消息滚出视口后会换掉 DOM 节点：元素级记账丢了，内容哈希还在。
+    // 这里原先是直接 return，于是重新挂载回来的历史块连「手动执行」入口都没有，
+    // 用户看到的是一个光秃秃的代码块，像是注入层没生效。补回元素记账与手动入口。
+    markProcessed(pre, id);
+    if (isHistoricalBlock(pre)) injectButton(pre, codeText, id, "历史消息，未自动执行");
+    return;
+  }
 
   // 历史消息：打开应用或切回旧会话时，DOM 里的代码块是当时的 AI 回复，
   // 不是这次的新请求。自动重放的后果是弹危险确认甚至真的执行旧命令，
@@ -615,11 +621,26 @@ function scheduleExecute(block, code, id) {
   pendingBlocks[id] = {
     code: code,
     block: block,
+    href: location.href,
     timer: setTimeout(function() {
+      var entry = pendingBlocks[id];
       delete pendingBlocks[id];
-      autoExecute(block, code, id);
+      if (!entry) return;
+      // 800ms 够用户切到另一个会话。不看当前状态就开火，会把上一条会话的代码真的
+      // 执行掉，再把结果打进「当前」会话的输入框并自动发送。
+      if (entry.href !== location.href) return;
+      if (entry.block && entry.block.isConnected === false) return;
+      autoExecute(entry.block, entry.code, id);
     }, 800)
   };
+}
+
+// 切会话/导航时调用：在飞的定时器全部作废，否则上一条会话排队的块会在新会话里开火
+function clearPendingBlocks() {
+  for (var k in pendingBlocks) {
+    if (pendingBlocks[k] && pendingBlocks[k].timer) clearTimeout(pendingBlocks[k].timer);
+    delete pendingBlocks[k];
+  }
 }
 
 // ============ 自动执行 ============
@@ -959,6 +980,11 @@ async function sendToInput(text) {
 function findInput() {
   var tas = document.querySelectorAll("textarea");
   for (var i = 0; i < tas.length; i++) {
+    // 先排掉注入层自己的输入框：GLM 侧栏收起态是 right:-440px 的 display:flex，
+    // offsetParent 并不为 null，于是 .glm-textarea 与 DeepSeek 的输入框在"可见"
+    // 这件事上等价。谁排前面取决于 React 何时建 #root，一旦轮到它，执行结果会被
+    // 写进 GLM 面板（那边只认 Ctrl+Enter），回传链静默断掉，还覆盖用户草稿。
+    if (isInjectedUI(tas[i])) continue;
     if (tas[i].offsetParent !== null) return tas[i];
   }
   return null;
@@ -974,6 +1000,7 @@ function findSendButton() {
   for (var s = 0; s < sels.length; s++) {
     var btns = document.querySelectorAll(sels[s]);
     for (var i = 0; i < btns.length; i++) {
+      if (isInjectedUI(btns[i])) continue;
       if (btns[i].offsetParent !== null) return btns[i];
     }
   }
@@ -1133,7 +1160,7 @@ var GLM_CSS = [
 var GLM_PANEL_HTML = [
   "<div class=\"glm-header\">",
   "  <div class=\"glm-title\">",
-  "    <div class=\"glm-title-icon\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\"><path d=\"M8 8L16 8L12 12L16 16L8 16L12 12Z\" fill=\"white\"/></svg></div>",
+  "    <div class=\"glm-title-icon\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 24 24\" fill=\"currentColor\" fill-rule=\"evenodd\" aria-hidden=\"true\"><path d=\"M12.105 2L9.927 4.953H.653L2.83 2h9.276zM23.254 19.048L21.078 22h-9.242l2.174-2.952h9.244zM24 2L9.264 22H0L14.736 2H24z\"/></svg></div>",
   "    <span>智谱 GLM 助手</span>",
   "  </div>",
   "  <div class=\"glm-header-actions\">",
@@ -1143,7 +1170,7 @@ var GLM_PANEL_HTML = [
   "</div>",
   "<div class=\"glm-chat-area\" id=\"glm-chat-area\">",
   "  <div class=\"glm-empty-state\">",
-  "    <div class=\"glm-empty-icon\"><svg width=\"32\" height=\"32\" viewBox=\"0 0 24 24\" fill=\"none\"><path d=\"M8 8L16 8L12 12L16 16L8 16L12 12Z\" fill=\"white\"/></svg></div>",
+  "    <div class=\"glm-empty-icon\"><svg width=\"32\" height=\"32\" viewBox=\"0 0 24 24\" fill=\"currentColor\" fill-rule=\"evenodd\" aria-hidden=\"true\"><path d=\"M12.105 2L9.927 4.953H.653L2.83 2h9.276zM23.254 19.048L21.078 22h-9.242l2.174-2.952h9.244zM24 2L9.264 22H0L14.736 2H24z\"/></svg></div>",
   "    <div class=\"glm-empty-title\">有什么我可以帮忙的？</div>",
   "    <div class=\"glm-empty-desc\">点击右上角 ⚙️ 配置 API Key 即可开始对话。</div>",
   "  </div>",
@@ -1266,8 +1293,8 @@ function injectGLMUI() {
       "transition:transform .2s,box-shadow .2s,opacity .2s;" +
       "user-select:none;touch-action:none;";
 
-    // ZAI 沙漏图标
-    openBtn.innerHTML = '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 6 L15 6 L12 12 L15 18 L9 18 L12 12 Z" fill="#FAF9F5"/></svg>';
+    // Z.ai 官方标识（轮廓取自 @lobehub/icons 的 ZAI 图标，viewBox 24×24）
+    openBtn.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd" aria-hidden="true"><path d="M12.105 2L9.927 4.953H.653L2.83 2h9.276zM23.254 19.048L21.078 22h-9.242l2.174-2.952h9.244zM24 2L9.264 22H0L14.736 2H24z"/></svg>';
 
     // 拖动逻辑
     var dragState = { active: false, moved: false, sx: 0, sy: 0, sl: 0, st: 0, maxL: 0, maxT: 0 };
@@ -1425,6 +1452,14 @@ function injectGLMUI() {
       if (res && res.encrypted === false) {
         alert("已保存。当前系统不支持加密存储，API Key 以明文保存在本机配置文件中。");
       }
+      // 保存成功后立刻把明文从 DOM 里抹掉。contextIsolation 只隔离 JS 全局与闭包，
+      // **不隔离 DOM** —— 这个 input 就长在 chat.deepseek.com 的文档树里，页面自己的
+      // 脚本随时能 getElementById("settings-apikey").value 读到密钥。
+      // 下次打开面板时上面的 open 处理器会重新按配置填掩码，所以清掉不影响使用。
+      apikeyInput.value = "";
+      delete apikeyInput.dataset.masked;
+      apikeyInput.type = "password";
+      if (togglePwdBtn) togglePwdBtn.textContent = "显示";
       settingsPanel.classList.remove("active");
     } catch (e) { alert("保存失败: " + e.message); }
     finally { saveBtn.disabled = false; saveBtn.textContent = "保存"; }

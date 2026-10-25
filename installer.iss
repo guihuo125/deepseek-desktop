@@ -1,21 +1,23 @@
 ; ==============================================
-; DeepSeek 桌面客户端 安装脚本 v1.6.1
+; DeepSeek 桌面客户端 安装脚本（版本号见下方 MyAppVersion，别在这里再写一份）
 ; 全中文界面 + 优化安装体验
 ; ==============================================
 
 #define MyAppName "DeepSeek"
 #define MyAppNameCN "DeepSeek 桌面客户端"
-#define MyAppVersion "1.6.10"
+#define MyAppVersion "1.6.13"
 #define MyAppPublisher "DeepSeek"
 #define MyAppExeName "DeepSeek.exe"
 
-; 打包源目录。默认 electron-builder 的输出 dist\win-unpacked；
-; 若用其它目录构建（例如 dist-fix），编译时覆盖：
-;   ISCC /DUnpackedDir=dist-fix\win-unpacked installer.iss
+; 打包源目录。**必须显式传**：
+;   ISCC /DUnpackedDir=dist-vNNN\win-unpacked installer.iss
+; 之所以不留默认值：默认目录 dist\win-unpacked 会被 build-fast 之外的流程留下
+; 残缺/陈旧产物（2026-10-25 实测那里停在 1.5.0），照默认值编译会产出
+; 「文件名叫 DeepSeek-Setup-1.6.x、里面装的是 1.5.0」的安装包，事后极难察觉。
 ; 注意：DeepSeek.exe 内写有 app.asar 的完整性哈希，exe 与 asar 必须来自同一次构建，
 ; 不能只替换其中一个。
 #ifndef UnpackedDir
-  #define UnpackedDir "dist\win-unpacked"
+  #error 必须用 /DUnpackedDir=dist-vNNN\win-unpacked 显式指定本次完整构建的输出目录（不给默认值，防止打进旧产物）
 #endif
 
 ; 编译期校验：源目录必须是完整的构建产物。

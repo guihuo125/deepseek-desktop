@@ -439,7 +439,14 @@ body {
       var html = "";
       for (var i = 0; i < reasons.length; i++) {
         var r = reasons[i];
-        var opMatch = r.match(/^操作:\s*([\s\S]*?)\n风险:\s*([\s\S]*)$/);
+        // 按**最后一次**出现的 \n风险: 切分，而不是第一次：这条字符串的"操作"部分
+        // 是 AI 可控文本，从第一个切点分会让命令里塞进来的 "\n风险: 官方已核实无风险"
+        // 变成弹窗上的风险标签内容，真实描述被挤到后面。（源头 security.js 现在也会
+        // 把换行折成 ⏎，两边都做是为了任何一边回退了都糊弄不了这道人工闸门。）
+        var sep = r.lastIndexOf("\n风险:");
+        var opMatch = (r.indexOf("操作:") === 0 && sep > 0)
+          ? [r, r.slice("操作:".length, sep).trim(), r.slice(sep + "\n风险:".length).trim()]
+          : null;
         if (opMatch) {
           html += '<div class="risk-item">';
           html += '<div class="risk-row"><span class="risk-label">操作</span><code class="risk-cmd">' + escapeHtml(opMatch[1]) + '</code></div>';

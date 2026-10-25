@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
@@ -9,17 +10,44 @@ const asar = createRequire(import.meta.url)("@electron/asar");
 
 // 快速打包：只重写 app.asar，不重编 Electron 本体。
 // 注意它不会更新 DeepSeek.exe 里的版本资源，也不会重算 exe 内的 asar 完整性哈希
-// 之外的任何东西 —— 升版本号那一次必须走 npm run build（完整 electron-builder）。
+// 之外的任何东西 —— 升版本号那一次必须走完整构建（electron-builder）。
 //
-// 目标目录默认 dist\win-unpacked（即包含 resources\app.asar 的那一层）。
-// 若该目录被文件句柄锁住（本项目常见），用环境变量指向别的构建输出：
+// 目标目录默认取 **mtime 最新的 dist-v*/win-unpacked**，并且会核对那里的
+// DeepSeek.exe 版本资源是否等于 package.json 的 version，不符就拒绝写入。
+// （2026-10-25 审查：默认值原先硬编码 dist\win-unpacked，而那个目录停在 1.5.0，
+//   不带 ASAR_OUT 跑一次就会把新版 asar 塞进旧 exe 旁边，产出 exe/asar 失配的包。）
+// 若目标目录被文件句柄锁住（本项目常见），用环境变量指向别的构建输出：
 //   ASAR_OUT=dist-fix2/win-unpacked node build-fast.mjs
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appDir = __dirname;
 const tmpDir = path.join(appDir, ".fast-asar-src");
 
-let unpackedDir = path.join(appDir, "dist", "win-unpacked");
+// 默认目标 = mtime 最新的 dist-v*/win-unpacked（完整构建的产物目录），
+// 一个都没有时才退回 dist\win-unpacked。
+function newestUnpacked() {
+  let best = null;
+  for (const e of fs.readdirSync(appDir, { withFileTypes: true })) {
+    if (!e.isDirectory() || !/^dist-v[\w.-]*$/.test(e.name)) continue;
+    const u = path.join(appDir, e.name, "win-unpacked");
+    if (!fs.existsSync(path.join(u, "resources", "app.asar"))) continue;
+    const t = fs.statSync(u).mtimeMs;
+    if (!best || t > best.t) best = { dir: u, t };
+  }
+  return best ? best.dir : path.join(appDir, "dist", "win-unpacked");
+}
+
+function exeProductVersion(exePath) {
+  // 路径经环境变量传入，不拼进命令串（避免项目目录里的空格/引号破坏解析）
+  return new Promise((resolve, reject) => {
+    execFile("powershell.exe",
+      ["-NoProfile", "-Command", "(Get-Item -LiteralPath $env:TARGET_EXE).VersionInfo.ProductVersion"],
+      { env: { ...process.env, TARGET_EXE: exePath }, windowsHide: true },
+      (err, out) => err ? reject(new Error("读取 exe 版本失败: " + err.message)) : resolve(String(out).trim()));
+  });
+}
+
+let unpackedDir = newestUnpacked();
 if (process.env.ASAR_OUT) {
   const target = path.resolve(appDir, process.env.ASAR_OUT);
   // 这个变量只是用来切换构建输出目录，不该变成任意路径写入
@@ -48,11 +76,25 @@ try {
     );
   }
 
+  const pkg = JSON.parse(fs.readFileSync(path.join(appDir, "package.json"), "utf-8"));
+
+  // exe 的版本资源是 electron-builder 在完整构建时写进去的，build-fast 改不了它。
+  // 所以只允许把 asar 换进「版本资源已经等于当前 package.json version」的目录，
+  // 否则会造出 exe 报 1.5.0、asar 报 1.6.x 的失配产物（实测踩过）。
+  const vi = await exeProductVersion(path.join(unpackedDir, "DeepSeek.exe"));
+  if (!vi.startsWith(pkg.version)) {
+    throw new Error(
+      `目标目录的 DeepSeek.exe 版本资源是 ${vi || "(读不到)"}，而 package.json 是 ${pkg.version}。\n` +
+      `  升版本号那一次必须跑完整构建：npx electron-builder --win --x64 --config.directories.output=dist-vNNN\n` +
+      `  只想快速验证界面，就 ASAR_OUT 指向本次完整构建的 win-unpacked。`
+    );
+  }
+  console.log(`目标: ${path.relative(appDir, unpackedDir)}  （exe 版本资源 ${vi} 与 package.json ${pkg.version} 一致）`);
+
   if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
   fs.mkdirSync(tmpDir, { recursive: true });
 
   // 运行时文件清单直接取自 package.json 的 build.files，避免两处各写一份必然漂移
-  const pkg = JSON.parse(fs.readFileSync(path.join(appDir, "package.json"), "utf-8"));
   const declared = (pkg.build && Array.isArray(pkg.build.files)) ? pkg.build.files : [];
 
   // 单文件条目（不含通配符）
@@ -75,7 +117,9 @@ try {
   );
   for (const dir of dirSet) {
     const srcRoot = path.join(appDir, dir);
-    if (!fs.existsSync(srcRoot)) { console.warn(`  ⚠ 目录不存在: ${dir}`); continue; }
+    // 目录缺失以前只 warn 后跳过，于是"整份主题 CSS 没进包"这种产物照样报成功；
+    // 快速包是拿来验证界面的，缺了就是白屏，必须当场失败。
+    if (!fs.existsSync(srcRoot)) throw new Error(`build.files 声明的目录不存在: ${dir}/`);
     const pats = declared
       .filter((f) => f.startsWith("!" + dir + "/"))
       .map((g) => {
@@ -105,6 +149,9 @@ try {
     } catch (e) {}
   }
   const nmSrc = path.join(appDir, "node_modules");
+  // 直接依赖缺失是硬错误（装了就跑不起来）；传递依赖可能由嵌套副本提供，只统计。
+  const missingDirect = prodDeps.filter((d) => !fs.existsSync(path.join(nmSrc, d)));
+  if (missingDirect.length) throw new Error("直接依赖未安装: " + missingDirect.join(", "));
   for (const d of prodDeps) collectDeps(d, nmSrc);
 
   const nmDst = path.join(tmpDir, "node_modules");

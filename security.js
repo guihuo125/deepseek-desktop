@@ -25,6 +25,9 @@ const FORBIDDEN = [
   { p: /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/, desc: "Fork 炸弹，会耗尽系统资源导致死机" },
   { p: /\breg\s+delete\s+HKLM\\SYSTEM/i,       desc: "删除系统注册表，会导致系统无法启动" },
   { p: /\bvssadmin\s+delete\s+shadows/i,       desc: "删除系统卷影副本，会破坏备份恢复能力" },
+  // wmic 与 vssadmin 是同一件事的另一个入口，只写 vssadmin 等于没写
+  { p: /\bwmic\s+shadowcopy\s+delete/i,        desc: "通过 wmic 删除卷影副本，与 vssadmin 同语义，会破坏备份恢复能力" },
+  { p: /\bwbadmin\s+delete\b/i,                desc: "删除系统备份，无法恢复" },
   { p: /\bdd\s+if=.*\bof=\/dev\//i,            desc: "dd 直写块设备，会覆盖整块磁盘，不可恢复" },
   { p: />\s*\/dev\/(sd|hd|nvme|disk)/i,        desc: "重定向覆盖块设备，会毁掉整块磁盘" },
   { p: /\bRemove-Item\b.*\b[CD]:\\?\s*$/i,     desc: "递归删除整个磁盘根目录，无法恢复" },
@@ -107,8 +110,43 @@ const DESTRUCTIVE_INTENT = [
   { p: /\brestart-computer\b/i,desc: "重启计算机" },
   { p: /\bstop-computer\b/i,   desc: "关闭计算机" },
   { p: /\btaskkill\b/i,        desc: "强制结束进程" },
-  { p: /\bstop-process\b/i,    desc: "结束进程" }
+  { p: /\bstop-process\b/i,    desc: "结束进程" },
+  // 别名与漏项（2026-10-25 审查实测）：只写 Remove-Item 而漏掉 PowerShell 官方别名
+  // ri，`pwsh("ri C:\x -Recurse -Force")` 就会一路落到「非白名单命令」分支被降级成
+  // 自动执行 —— 递归删除不弹窗，直接违背「删除必须确认」这条策略的本意。
+  { p: /(^|[\s;&|`(])ri(\s|$)/i,   desc: "ri 是 Remove-Item 别名，删除文件/目录" },
+  { p: /(^|[\s;&|`(])kill(\s|$)/i, desc: "kill 强制结束进程" }
 ];
+
+// 命令名层面的删除/杀进程动词（含别名），供 classifyShell 解析出 exe 后判定。
+// 与 DESTRUCTIVE_INTENT 的整段关键字扫描互补：关键字扫描管管道里的第二段，
+// 这里管第一段。
+const DESTRUCTIVE_EXE = new Set([
+  "rm", "rmdir", "rd", "del", "erase", "unlink", "shred",
+  "remove-item", "ri", "delitem", "di", "remove-itemproperty", "rp",
+  "remove-psdrive", "kill", "stop-process", "spps", "taskkill",
+  "shutdown", "restart-computer", "stop-computer"
+]);
+
+// ============ 编码/动态执行：静态审查看不见载荷 ============
+// 这几条的共同点是「真正的命令在运行时才存在」，前面所有的关键字/路径扫描
+// 扫的都是编码前的文本，等于全部失效。实测 `pwsh("powershell -enc ...")`、
+// `python("...exec(base64.b64decode(...))")` 都判 safe 自动执行。
+const OPAQUE_EXEC = [
+  { p: /-(?:enc|encodedcommand)\b/i,  desc: "PowerShell -EncodedCommand：命令以 Base64 传入，内容无法静态审查" },
+  { p: /\biex\b|invoke-expression/i,    desc: "Invoke-Expression / iex：动态执行字符串，等价于任意代码执行" },
+  { p: /frombase64string|b64decode|base64\.b64decode/i, desc: "运行时解码 Base64 载荷，静态审查看不到真实命令" },
+  { p: /\bexec\s*\(\s*(?:compile|codecs|base64|marshal)/i, desc: "解码后动态执行 Python 代码" },
+  { p: /\badd-type\b/i,                 desc: "Add-Type 在内存里编译并执行 C# 代码，绕过所有文本层审查" },
+  { p: /certutil\s+-(?:decode|urlcache)/i, desc: "certutil 解码/下载后常配合执行，载荷不可见" },
+  { p: /\bmklink\b|-(?:itemtype|type)\s+(?:symboliclink|junction)/i, desc: "创建符号链接/目录联接，可把后续读写引到工作区外" }
+];
+
+function matchesTable(table, code) {
+  const src = String(code || "");
+  for (const t of table) if (t.p.test(src)) return t.desc;
+  return null;
+}
 
 function hasDestructiveIntent(code) {
   const src = String(code || "");
@@ -376,6 +414,24 @@ function scanToolCalls(code) {
   return calls;
 }
 
+// 工具名被间接引用（赋值给变量、成员访问、逗号表达式、当值传走）时，真正的调用点
+// 静态看不到，参数也就从没进过 classifyShell。实测 `let f = bash; f("ri C:\x -Force")`、
+// `(0,bash)("ri ...")`、`const o={bash:bash}; o.bash("ri ...")` 三条全部判 safe，
+// 等于整套分级被绕过。只看去掉字符串与注释后的裸代码，所以 console.log 这类
+// 成员访问不会被误伤（log 前面是点）。
+function findIndirectToolRef(bareCode) {
+  const re = /([A-Za-z_$][\w$]*)/g;
+  let m;
+  while ((m = re.exec(bareCode))) {
+    const name = m[1];
+    if (TOOL_NAMES.indexOf(name) === -1) continue;
+    if (/\.\s*$/.test(bareCode.slice(0, m.index))) continue;
+    if (/^\s*\(/.test(bareCode.slice(m.index + name.length))) continue;
+    return name;
+  }
+  return null;
+}
+
 // ============ shell 命令判定 ============
 
 // 取出命令的第一个 token（可执行名），正确处理带引号的路径
@@ -422,7 +478,9 @@ function extractPathTokens(cmd) {
       i = end === -1 ? cmd.length : end + 1;
       continue;
     }
-    if (/^[A-Za-z]:[\\/]/.test(cmd.slice(i, i + 3))) {
+    if (/^[A-Za-z]:[\\/]/.test(cmd.slice(i, i + 3)) && !/[A-Za-z0-9_$]/.test(cmd[i - 1] || "")) {
+      // 前一个字符不能是标识符字符：否则注册表路径 HKCU:\Software 会被人从中间
+      // 截出 "U:\Software" 当成工作区外的磁盘路径（实测会误弹一次确认）。
       let j = i;
       while (j < cmd.length && !/[\s"'|&;<>)]/.test(cmd[j])) j++;
       tokens.push(cmd.slice(i, j));
@@ -432,6 +490,47 @@ function extractPathTokens(cmd) {
     i++;
   }
   return tokens;
+}
+
+// 各工具的路径参数在第几个位置：grep 的第一个参数是模式，路径是第二个。
+// 不能"所有字符串参数都当路径查"，否则 write("a.txt", "C:\\Windows\\x") 会把
+// 文件内容里的绝对路径误判成越界。
+const PATH_ARG = { read: 0, write: 0, edit: 0, glob: 0, grep: 1 };
+
+function toolPathArg(name, call) {
+  const idx = PATH_ARG[name];
+  return idx == null ? null : call.args[idx];
+}
+
+// 工具调用（read/write/edit/glob/grep）的路径参数。
+// 只读工具同样能把工作区外的文件内容读出来并自动回传云端，所以边界检查
+// 不能只做在 shell 通道上。执行侧还有 runner.safePath 兜底，这里的职责是
+// 「让越界变成一次可见的确认」，而不是唯一防线 —— 所以不把「路径来自变量」
+// 升级成弹窗（`const f="src/a.js"; read(f)` 是常见写法，误伤代价太高）。
+function toolPathEscapeReason(arg, options) {
+  if (!arg) return null;
+  const ws = options && options.workspace;
+  if (typeof arg.literal === "string" && arg.literal) {
+    return checkOnePath(arg.literal, ws);
+  }
+  // 非字面量（对象字面量 / 变量）：退一步扫原文里能看见的绝对路径。
+  // grep 的搜索根就在第二个参数的 { path: "..." } 里。
+  const raw = String(arg.raw || "");
+  for (const token of extractPathTokens(raw)) {
+    const why = checkOnePath(token, ws);
+    if (why) return why;
+  }
+  return null;
+}
+
+function checkOnePath(p, ws) {
+  if (/^[A-Za-z]:[\\/]/.test(p) || /^\\\\/.test(p)) {
+    if (!ws) return "工具访问绝对路径，但未设置工作区，无法确认是否越界";
+    if (!isInsideWorkspace(path.resolve(p), ws)) return "工具访问工作区之外的路径：" + p;
+    return null;
+  }
+  if (/(^|[\\/])\.\.([\\/]|$)/.test(p)) return "工具路径包含 ..，可能跳出工作区：" + p;
+  return null;
 }
 
 function pathEscapeReason(cmd, workspace) {
@@ -473,6 +572,26 @@ function classifyShell(cmd, flavor, options) {
   if (/(https?|ftp|file):/i.test(cmd)) {
     return { ok: false, hard: true, why: "命令包含网络/文件协议地址" };
   }
+  // 工作区外的绝对路径必须在「控制符 / 非白名单」这两次降级之前判。
+  // 旧实现把 pathEscapeReason 放在白名单判定之后，于是 `echo x > C:\...\Startup\x.bat`
+  // （带 >）、`copy /y C:\Users\me\Desktop\a.txt D:\pub`（非白名单）全部绕过越界检查，
+  // 实测直接自动执行 —— 而浮层一直在对用户承诺「读写仅限该目录内」。
+  for (const token of extractPathTokens(cmd)) {
+    if (!/^[A-Za-z]:[\\/]/.test(token)) continue;
+    if (!(options && options.workspace)) {
+      return { ok: false, hard: true, why: "命令引用了绝对路径，但未设置工作区，无法确认是否越界" };
+    }
+    if (!isInsideWorkspace(path.resolve(token), options.workspace)) {
+      return { ok: false, hard: true, why: "命令访问工作区之外的路径：" + token };
+    }
+  }
+  // 整盘导出环境变量：里面通常躺着 API Key / Token，而执行结果会自动回传云端。
+  // 注意只拦「列举整个 env: 驱动」与裸 set/printenv，引用单个 $env:VAR 仍按
+  // 用户要求的「变量展开不弹窗」放行。
+  if (/(^|[\s;&|`(])(set|printenv)(\s|$|[)&|;"])/i.test(cmd) ||
+      /\b(get-childitem|gci|dir|ls|get-item|gi)\s+(?:-path\s+)?env:/i.test(cmd)) {
+    return { ok: false, hard: true, why: "命令会整盘导出环境变量（可能包含密钥），执行结果会自动回传给云端" };
+  }
   // shell 控制符 / 变量展开 / 命令分组：按用户要求不再弹窗，
   // 但删除/关机等不可逆操作会在 finish() 里按整段源码再拦一次
   if (/[|&;<>`$(){}!]/.test(cmd)) {
@@ -484,6 +603,17 @@ function classifyShell(cmd, flavor, options) {
   const exe = token.exe.split(/[\\/]/).pop().toLowerCase().replace(/\.(exe|com|bat|cmd|ps1)$/, "");
   const whitelist = flavor === "pwsh" ? PS_READONLY : CMD_READONLY;
   if (!exe) return { ok: false, hard: true, why: "无法解析出命令名" };
+  // 命令名本身就是删除/杀进程动词（含别名）—— 必须在「非白名单 → 降级」之前判，
+  // 否则 `ri`、`kill` 这些会因为不在只读白名单里而被当成普通非白名单命令放行。
+  if (DESTRUCTIVE_EXE.has(exe)) {
+    return { ok: false, hard: true, why: "`" + exe + "` 属于删除/结束进程类命令，操作不可逆" };
+  }
+  if (exe === "reg" && /\bdelete\b/i.test(cmd)) {
+    return { ok: false, hard: true, why: "reg delete 删除注册表项，可能导致系统或软件不可用" };
+  }
+  if (exe === "schtasks" && /\/delete/i.test(cmd)) {
+    return { ok: false, hard: true, why: "schtasks /delete 删除计划任务" };
+  }
   if (!whitelist.has(exe)) {
     // 用户要求「只有删除才弹」：非白名单命令也放行自动执行。
     // 这是明确的策略选择，风险由 finish() 里的删除/逃逸检测兜底。
@@ -534,6 +664,17 @@ function checkCode(code, options) {
     if (e.p.test(bareCode)) add("dangerous", "(代码片段)", e.desc, true);
   }
 
+  // ---- 2b. 编码/动态执行：载荷在运行时才存在，扫字符串本体没有意义 ----
+  const opaque = matchesTable(OPAQUE_EXEC, scannable);
+  if (opaque) add("dangerous", "(代码片段)", opaque, true);
+
+  // ---- 2c. 工具被间接引用，调用点无法静态识别 ----
+  const indirect = findIndirectToolRef(bareCode);
+  if (indirect) {
+    add("dangerous", "(代码片段)",
+      "工具名 " + indirect + " 被间接引用（赋值给变量 / 别名 / 成员访问），实际调用与参数无法静态审查", true);
+  }
+
   // ---- 3. 逐个工具调用判定 ----
   const calls = scanToolCalls(src);
 
@@ -558,13 +699,31 @@ function checkCode(code, options) {
   for (const call of calls) {
     const name = call.name;
 
-    if (READONLY_TOOLS.has(name)) continue;
+    if (READONLY_TOOLS.has(name)) {
+      // 只读工具也要过边界：实测 read("C:\Users\me\.ssh\id_rsa") 原先判 safe，
+      // 私钥内容会被原样回传给云端 —— 这是本轮审查里后果最直接的一条。
+      if (name !== "log" && name !== "sleep") {
+        const why = toolPathEscapeReason(toolPathArg(name, call), options);
+        if (why) {
+          const shown = toolPathArg(name, call);
+          add("dangerous", name + "(" + (shown ? (shown.literal || shown.raw) : "") + ")",
+            why, true);
+        }
+      }
+      continue;
+    }
 
     if (MUTATING_TOOLS.has(name)) {
-      const target = call.args[0] ? (call.args[0].literal || call.args[0].raw) : "(未知路径)";
-      // 写文件按用户要求不再确认（工作区边界仍由 runner.safePath 兜底）
-      add("dangerous", name + "(" + target + ")",
-        name === "write" ? "写入/覆盖文件，会改变磁盘内容" : "修改文件内容，会改变磁盘内容", false);
+      const pathArg = toolPathArg(name, call);
+      const target = pathArg ? (pathArg.literal || pathArg.raw) : "(未知路径)";
+      const why = toolPathEscapeReason(pathArg, options);
+      if (why) {
+        // 写工作区外 = 越界，属硬信号；写工作区内按用户要求不弹窗
+        add("dangerous", name + "(" + target + ")", why, true);
+      } else {
+        add("dangerous", name + "(" + target + ")",
+          name === "write" ? "写入/覆盖文件，会改变磁盘内容" : "修改文件内容，会改变磁盘内容", false);
+      }
       continue;
     }
 
@@ -604,7 +763,13 @@ function finish(result, code) {
     return result;
   }
   result.reasons = result.items.map(function (it) {
-    return "操作: " + it.cmd + "\n风险: " + it.desc;
+    // cmd 是 AI 可控文本，而 reasons 是「操作: X\n风险: Y」这种拼串格式，
+    // 弹窗侧要靠这两个标记切回来。于是命令里塞一个换行 + "风险:" 就能自拟一行
+    // 看起来像系统判定的说明（例如"官方已核实：无任何数据损失"），
+    // 把真实描述挤到后面 —— 这是确认弹窗，被糊弄的就是最后一道人工闸门。
+    // 折掉换行（顺带让行首的"风险:"不再成其为行首）即可让格式无法被伪造。
+    const oneLine = (s) => String(s == null ? "" : s).replace(/[\r\n]+/g, " ⏎ ");
+    return "操作: " + oneLine(it.cmd) + "\n风险: " + oneLine(it.desc);
   });
   return result;
 }

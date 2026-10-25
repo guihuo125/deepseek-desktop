@@ -362,6 +362,32 @@ const DIALOG_TIMEOUT_MS = 10 * 60 * 1000;
 let worker = null;
 const workerPending = new Map();
 let workerSeq = 0;
+// 执行进程常驻会白占一份 utilityProcess 内存（实测 20–40MB）。空闲 5 分钟就回收，
+// 下次执行自动重建；只有完全没有在飞的任务时才敢杀，避免把 pending 一起 reject 掉。
+const WORKER_IDLE_MS = 5 * 60 * 1000;
+let workerIdleTimer = null;
+// 单个任务的日志上限：长任务可能刷出几万行，全部留在主进程再经 IPC 发给渲染进程，
+// 既吃内存又拖慢回传。保留尾部 400 条 / 128KB 足够定位问题。
+const MAX_WORKER_LOGS = 400;
+const MAX_WORKER_LOG_CHARS = 128 * 1024;
+
+function scheduleWorkerIdle() {
+  if (workerIdleTimer) clearTimeout(workerIdleTimer);
+  workerIdleTimer = setTimeout(() => {
+    workerIdleTimer = null;
+    if (workerPending.size !== 0) return;
+    console.log("[runner] 空闲回收执行进程");
+    killWorker();
+  }, WORKER_IDLE_MS);
+  if (workerIdleTimer.unref) workerIdleTimer.unref();
+}
+
+function clearWorkerIdle() {
+  if (workerIdleTimer) {
+    clearTimeout(workerIdleTimer);
+    workerIdleTimer = null;
+  }
+}
 
 function onWorkerMessage(msg) {
   if (!msg || typeof msg !== "object") return;
@@ -392,12 +418,22 @@ function onWorkerMessage(msg) {
   if (!entry) return;
 
   if (msg.type === "log") {
-    entry.logs.push(msg.msg);
-    console.log("[cuckoo]", msg.msg);
+    if (entry.logs.length >= MAX_WORKER_LOGS || entry.logChars >= MAX_WORKER_LOG_CHARS) {
+      if (!entry.logTruncated) {
+        entry.logTruncated = true;
+        console.log("[cuckoo] 日志过多，后续输出已截断");
+      }
+      return;
+    }
+    const line = String(msg.msg == null ? "" : msg.msg);
+    entry.logs.push(line);
+    entry.logChars += line.length;
+    console.log("[cuckoo]", line);
     return;
   }
   workerPending.delete(msg.id);
   clearTimeout(entry.timer);
+  scheduleWorkerIdle();
   if (msg.type === "done") {
     entry.resolve(msg.payload);
   } else {
@@ -417,6 +453,7 @@ function spawnWorker() {
   worker.on("exit", (code) => {
     console.warn("[runner] 执行进程退出, code=" + code);
     worker = null;
+    clearWorkerIdle();
     // 不能让渲染进程的 invoke 永久挂起
     for (const [, entry] of workerPending) {
       clearTimeout(entry.timer);
@@ -424,6 +461,7 @@ function spawnWorker() {
     }
     workerPending.clear();
   });
+  scheduleWorkerIdle();
   return worker;
 }
 
@@ -444,8 +482,9 @@ function executeInWorker(code) {
       return;
     }
 
+    clearWorkerIdle();
     const id = "w" + (++workerSeq);
-    const entry = { resolve: resolve, reject: reject, logs: [], timer: null };
+    const entry = { resolve: resolve, reject: reject, logs: [], logChars: 0, logTruncated: false, timer: null };
 
     // 比 worker 内部的看门狗多留 15 秒余量，兜住 worker 自身卡死的情况
     entry.timer = setTimeout(() => {
@@ -630,6 +669,14 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, "shell.html"));
+
+  // 壳层拿着权限最高的 shellAPI（导航、工作区、清缓存、开机自启）。
+  // 子窗口即使继承了 preload，event.sender.id 也不等于主窗口的 webContents.id，
+  // senderIsShell 会拒掉 —— 但没必要把「壳页被诱导开新窗/跳走」这个面留着。
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  mainWindow.webContents.on("will-navigate", (e, url) => {
+    if (!/^file:/i.test(url)) e.preventDefault();
+  });
 
   // === 2. AI 网页视图 ===
   aiView = new WebContentsView({
@@ -1216,7 +1263,15 @@ ipcMain.handle("shell-navigate", async (event, url) => {
 });
 
 // ============ 主题 IPC ============
-ipcMain.handle("get-theme", () => ({ theme: currentTheme, resolved: resolvedTheme }));
+// 只有壳层与连接浮层需要主题档位。这条原先是全文件唯一不带来源校验的 handle，
+// 泄露的虽然只是一个主题名，但"所有 handle 都校验来源"这个约定一旦开了口子，
+// 下一个补上去的通道就会照着它写。
+ipcMain.handle("get-theme", (event) => {
+  if (!senderIsShell(event) && !senderIsSecurityView(event)) {
+    return { theme: "system", resolved: "light" };
+  }
+  return { theme: currentTheme, resolved: resolvedTheme };
+});
 
 ipcMain.handle("set-theme", (event, theme) => {
   try { assertTrustedSender(event); } catch (e) { return { ok: false, error: e.message }; }
@@ -1563,7 +1618,7 @@ function setupAutoUpdater() {
   autoUpdater.on("update-not-available", () => { console.log("[Update] 已是最新版本"); });
   autoUpdater.on("download-progress", (p) => { console.log("[Update] 下载进度:", Math.round(p.percent) + "%"); });
 
-  autoUpdater.on("update-downloaded", (info) => {
+  autoUpdater.on("update-downloaded", async (info) => {
     console.log("[Update] 下载完成:", info.version);
     const opts = {
       type: "info",
@@ -1574,12 +1629,16 @@ function setupAutoUpdater() {
       defaultId: 1,
       cancelId: 0
     };
-    // 主窗口可能已经销毁：showMessageBoxSync(null, opts) 会抛
-    // "Invalid arguments"，必须换成不带窗口的重载。
+    // 主窗口可能已经销毁：showMessageBox(null, opts) 会抛 "Invalid arguments"，
+    // 必须换成不带窗口的重载。
+    // 必须用异步版：同步版 dialog.showMessageBoxSync 会**冻结整个主进程**直到用户点击，
+    // 期间所有 ipcMain.handle 停摆 —— 正在跑的执行收不到回包、危险确认弹窗弹不出来，
+    // 界面像假死，而用户可能根本不在电脑前。
     let choice = 0;
     try {
       const parent = (mainWindow && !mainWindow.isDestroyed()) ? mainWindow : null;
-      choice = parent ? dialog.showMessageBoxSync(parent, opts) : dialog.showMessageBoxSync(opts);
+      choice = parent ? (await dialog.showMessageBox(parent, opts)).response
+                      : (await dialog.showMessageBox(opts)).response;
     } catch (e) {
       console.error("[Update] 弹窗失败:", e.message);
       return;
